@@ -1,5 +1,27 @@
 import 'dart:typed_data';
 
+/// Duplicate mono float32 samples into interleaved stereo.
+Float32List monoToStereo(Float32List mono) {
+  final out = Float32List(mono.length * 2);
+  for (var i = 0; i < mono.length; i++) {
+    final s = mono[i];
+    out[i * 2] = s;
+    out[i * 2 + 1] = s;
+  }
+  return out;
+}
+
+/// Encode mono float32 as 16-bit stereo WAV (L=R).
+Uint8List encodeWavMonoInt16({
+  required Float32List mono,
+  required int sampleRate,
+}) {
+  return encodeWavInt16(
+    interleavedStereo: monoToStereo(mono),
+    sampleRate: sampleRate,
+  );
+}
+
 /// Encode interleaved float32 stereo PCM as a 16-bit WAV for [SoLoud.loadMem].
 Uint8List encodeWavInt16({
   required Float32List interleavedStereo,

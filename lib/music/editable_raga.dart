@@ -364,9 +364,14 @@ class EditableRaga {
   }
 
   /// Builds playback: stepped holds by default; curved edges sample a Bezier.
+  ///
+  /// Stepped points re-attack (Sa–Sa = two articulations). Bent edges glide
+  /// continuously into the landing note — no mute/re-attack at arrival.
   TimedPitchEnvelope toEnvelope({
     double stepSeconds = 0.002,
-    int curveSamples = 24,
+    int curveSamples = 64,
+    double attackSeconds = 0.02,
+    double releaseSeconds = 0.03,
   }) {
     if (points.isEmpty) {
       return TimedPitchEnvelope(
@@ -378,68 +383,93 @@ class EditableRaga {
       ..sort((a, b) => a.beat.compareTo(b.beat));
     final out = <TimedPitchPoint>[];
 
-    void addSample(double beat, double cents, double amp) {
-      final t = beat * beatSeconds;
+    void addAt(double seconds, double cents, double amp) {
+      final t = seconds < 0 ? 0.0 : seconds;
       if (out.isNotEmpty && (t - out.last.seconds).abs() < 1e-9) {
         out[out.length - 1] =
             TimedPitchPoint(seconds: t, cents: cents, amp: amp);
         return;
       }
+      if (out.isNotEmpty && t < out.last.seconds) {
+        return;
+      }
       out.add(TimedPitchPoint(seconds: t, cents: cents, amp: amp));
     }
 
-    addSample(sorted.first.beat, sorted.first.cents, sorted.first.amp);
+    bool isSounding(CurvePoint p) => p.amp > 0.05;
+
+    // First note: attack.
+    final first = sorted.first;
+    final t0 = first.beat * beatSeconds;
+    if (isSounding(first)) {
+      addAt(t0, first.cents, 0);
+      addAt(t0 + attackSeconds, first.cents, first.amp);
+    } else {
+      addAt(t0, first.cents, 0);
+    }
 
     for (var i = 1; i < sorted.length; i++) {
       final prev = sorted[i - 1];
       final next = sorted[i];
-      if (next.hasBend) {
-        final n = math.max(4, curveSamples);
+      final tNext = next.beat * beatSeconds;
+      final noteAmp = isSounding(next) ? next.amp : 0.0;
+
+      if (next.hasBend && isSounding(next)) {
+        // Time-uniform glide (Bezier drives cents only). Using Bezier beat for
+        // time can go non-monotonic when the handle is pulled sideways → clicks.
+        final tPrev = math.max(out.last.seconds, prev.beat * beatSeconds);
+        final n = math.max(16, curveSamples);
+        final sustain = math.max(
+          out.isNotEmpty ? out.last.amp : prev.amp,
+          math.max(noteAmp, 0.85),
+        );
+        // Include u=1 so we land exactly on next (no mute/re-attack click).
         for (var s = 1; s <= n; s++) {
-          final t = s / n;
-          final (beat, cents) = quadBezier(
+          final u = s / n;
+          final (_, cents) = quadBezier(
             prev,
             next.bendBeat!,
             next.bendCents!,
             next,
-            t,
+            u,
           );
-          final amp = prev.amp + (next.amp - prev.amp) * t;
-          addSample(beat, cents, amp);
+          final t = tPrev + (tNext - tPrev) * u;
+          final amp = s == n ? noteAmp : sustain;
+          addAt(t, cents, amp);
         }
       } else {
-        // Hold previous pitch until just before this attack, then step.
-        final t = next.beat * beatSeconds;
-        final holdEnd = math.max(out.last.seconds, t - stepSeconds);
-        if (holdEnd > out.last.seconds + 1e-9) {
-          out.add(TimedPitchPoint(
-            seconds: holdEnd,
-            cents: prev.cents,
-            amp: prev.amp,
-          ));
+        // Stepped: hold, release to silence, then attack next (Sa→Sa = 2 notes).
+        if (isSounding(prev)) {
+          final releaseAt =
+              math.max(out.last.seconds + 1e-4, tNext - releaseSeconds);
+          if (releaseAt > out.last.seconds + 1e-9) {
+            addAt(releaseAt, prev.cents, prev.amp);
+          }
+          addAt(
+            math.max(releaseAt + 1e-4, tNext - stepSeconds),
+            prev.cents,
+            0,
+          );
         }
-        out.add(TimedPitchPoint(
-          seconds: t,
-          cents: next.cents,
-          amp: next.amp,
-        ));
+        if (isSounding(next)) {
+          addAt(tNext, next.cents, 0);
+          addAt(tNext + attackSeconds, next.cents, noteAmp);
+        } else {
+          addAt(tNext, next.cents, 0);
+        }
       }
     }
 
     final endSec = totalBeats * beatSeconds;
     final last = out.last;
     if (last.seconds < endSec - 1e-9) {
-      out.add(TimedPitchPoint(
-        seconds: endSec,
-        cents: last.cents,
-        amp: 0.0,
-      ));
+      if (last.amp > 0.05) {
+        addAt(math.max(last.seconds, endSec - releaseSeconds), last.cents,
+            last.amp);
+      }
+      addAt(endSec, last.cents, 0.0);
     } else if (last.amp > 0.05) {
-      out.add(TimedPitchPoint(
-        seconds: last.seconds + 0.05,
-        cents: last.cents,
-        amp: 0.0,
-      ));
+      addAt(last.seconds + 0.05, last.cents, 0.0);
     }
     return TimedPitchEnvelope(
       out,

@@ -98,6 +98,8 @@ class RagaGridPainter extends CustomPainter {
     required this.laneLabels,
     required this.viewport,
     this.activeEdgeDest,
+    /// Absolute beat position of the playhead; null hides it.
+    this.playheadBeat,
   });
 
   final EditableRaga raga;
@@ -106,6 +108,7 @@ class RagaGridPainter extends CustomPainter {
 
   /// Destination point index of the edge being bent (highlight).
   final int? activeEdgeDest;
+  final double? playheadBeat;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -277,6 +280,21 @@ class RagaGridPainter extends CustomPainter {
     final dot = Paint()..color = AppColors.goldSoft;
     for (final p in pts) {
       canvas.drawCircle(Offset(xFor(p.beat), yFor(p.cents)), 3.2, dot);
+    }
+
+    final ph = playheadBeat;
+    if (ph != null) {
+      final x = xFor(ph);
+      if (x >= -1 && x <= size.width + 1) {
+        canvas.drawLine(
+          Offset(x, 0),
+          Offset(x, size.height),
+          Paint()
+            ..color = const Color(0x800088FF) // blue @ 50%
+            ..strokeWidth = 1.5
+            ..isAntiAlias = true,
+        );
+      }
     }
     canvas.restore();
   }

@@ -45,8 +45,10 @@ class VoiceSynth {
           ? 1.0
           : (b.seconds - a.seconds);
       final u = ((t - a.seconds) / span).clamp(0.0, 1.0);
+      // Linear cents keeps F0 continuous on glides; s-curve only on amp
+      // (avoids pitch “crunch” when envelope points are sparse).
+      final cents = a.cents + (b.cents - a.cents) * u;
       final sCurve = u * u * (3 - 2 * u);
-      final cents = a.cents + (b.cents - a.cents) * sCurve;
       final amp = a.amp + (b.amp - a.amp) * sCurve;
 
       final freq = saHz * math.pow(2.0, cents / 1200.0);
@@ -56,14 +58,18 @@ class VoiceSynth {
       for (var h = 0; h < harmonics.length; h++) {
         wave += math.sin(phase * (h + 1)) * harmonics[h];
       }
-      final sample = _softClip(wave) * amp * gain * edge;
+      // Soften peaks without hard clip zipper on fast glides.
+      final sample = _softClip(wave * 0.85) * amp * gain * edge;
       if (sample.abs() > peak) peak = sample.abs();
 
       out[i * 2] = sample;
       out[i * 2 + 1] = sample;
 
       phase += twoPi * freq / sampleRate;
-      if (phase > twoPi * 16) phase -= twoPi * 16;
+      // Keep phase bounded without discontinuous wraps mid-cycle.
+      while (phase >= twoPi) {
+        phase -= twoPi;
+      }
     }
 
     // Peak-normalize for a consistent listening level.

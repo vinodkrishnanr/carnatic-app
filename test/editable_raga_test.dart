@@ -129,6 +129,30 @@ void main() {
     expect(after.cents, closeTo(Swara.ri2.cents, 1.0));
   });
 
+  test('Sa Sa re-articulates — amp dips between identical pitches', () {
+    final r = EditableRaga(
+      id: 'sasa',
+      name: 'sasa',
+      scale: [Swara.sa],
+      points: [
+        CurvePoint(beat: 0, cents: Swara.sa.cents),
+        CurvePoint(beat: 1, cents: Swara.sa.cents),
+        CurvePoint(beat: 2, cents: Swara.sa.cents, amp: 0),
+      ],
+      totalBeats: 2,
+      beatsPerMinute: 60,
+      gridLock: false,
+    );
+    final env = r.toEnvelope();
+    // First note sounding.
+    expect(env.sampleAtSeconds(0.05).amp, greaterThan(0.5));
+    // Gap at the second attack instant (amp 0 before swell).
+    expect(env.sampleAtSeconds(1.0).amp, lessThan(0.05));
+    // Second Sa attacks again.
+    expect(env.sampleAtSeconds(1.05).amp, greaterThan(0.5));
+    expect(env.sampleAtSeconds(1.05).cents, closeTo(Swara.sa.cents, 1.0));
+  });
+
   test('edge bend follows Bezier — not a hard Sa hold', () {
     final r = EditableRaga(
       id: 'bend',
@@ -151,6 +175,14 @@ void main() {
     // Curved edge leaves Sa before beat 2.
     expect(mid.cents, greaterThan(Swara.sa.cents + 20));
     expect(mid.cents, isNot(closeTo(Swara.sa.cents, 1.0)));
+
+    // Envelope times stay monotonic (sideways handle must not reverse time).
+    for (var i = 1; i < env.points.length; i++) {
+      expect(env.points[i].seconds, greaterThanOrEqualTo(env.points[i - 1].seconds));
+    }
+    // Landing stays sounding — no amp→0 re-attack click after the glide.
+    expect(env.sampleAtSeconds(2.0).amp, greaterThan(0.5));
+    expect(env.sampleAtSeconds(2.0).cents, closeTo(Swara.ri2.cents, 1.0));
 
     // Drag control back to the step elbow → bend clears.
     r.setEdgeBend(1, 2.0, Swara.sa.cents);

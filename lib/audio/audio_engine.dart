@@ -205,12 +205,27 @@ class AudioEngine {
     return result;
   }
 
+  /// Play mono PCM (e.g. cropped waveform) at [pcmSampleRate].
+  Future<void> playMono({
+    required Float32List mono,
+    required int pcmSampleRate,
+    String label = 'wave',
+  }) async {
+    if (!_ready) await init();
+    await stopPhrase();
+    final wav = encodeWavMonoInt16(mono: mono, sampleRate: pcmSampleRate);
+    await _playWavBytes(wav, label: label);
+  }
+
   Future<void> _playPcm(Float32List pcm, {required String label}) async {
     final wav = encodeWavInt16(
       interleavedStereo: pcm,
       sampleRate: sampleRate,
     );
+    await _playWavBytes(wav, label: label);
+  }
 
+  Future<void> _playWavBytes(Uint8List wav, {required String label}) async {
     if (_phraseSource != null) {
       await SoLoud.instance.disposeSource(_phraseSource!);
       _phraseSource = null;
@@ -241,8 +256,49 @@ class AudioEngine {
     _phraseHandle = null;
   }
 
+  /// Pause active playback (no-op if nothing is playing).
+  void pausePhrase() {
+    final h = _phraseHandle;
+    if (h == null) return;
+    if (!SoLoud.instance.getIsValidVoiceHandle(h)) {
+      _phraseHandle = null;
+      return;
+    }
+    SoLoud.instance.setPause(h, true);
+  }
+
+  /// Resume a paused voice.
+  void resumePhrase() {
+    final h = _phraseHandle;
+    if (h == null) return;
+    if (!SoLoud.instance.getIsValidVoiceHandle(h)) {
+      _phraseHandle = null;
+      return;
+    }
+    SoLoud.instance.setPause(h, false);
+  }
+
   bool get isPhrasePlaying {
     if (_phraseHandle == null) return false;
     return SoLoud.instance.getIsValidVoiceHandle(_phraseHandle!);
+  }
+
+  bool get isPhrasePaused {
+    final h = _phraseHandle;
+    if (h == null) return false;
+    if (!SoLoud.instance.getIsValidVoiceHandle(h)) return false;
+    return SoLoud.instance.getPause(h);
+  }
+
+  /// Playhead 0–1 for the active voice, or null if nothing is playing.
+  double? get playbackProgress {
+    final h = _phraseHandle;
+    final src = _phraseSource;
+    if (h == null || src == null) return null;
+    if (!SoLoud.instance.getIsValidVoiceHandle(h)) return null;
+    final len = SoLoud.instance.getLength(src);
+    if (len.inMicroseconds <= 0) return null;
+    final pos = SoLoud.instance.getPosition(h);
+    return (pos.inMicroseconds / len.inMicroseconds).clamp(0.0, 1.0);
   }
 }
