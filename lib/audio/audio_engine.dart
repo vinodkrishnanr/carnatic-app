@@ -301,4 +301,20 @@ class AudioEngine {
     final pos = SoLoud.instance.getPosition(h);
     return (pos.inMicroseconds / len.inMicroseconds).clamp(0.0, 1.0);
   }
+
+  /// Seek the active voice to [progress] (0–1). No-op if nothing is loaded.
+  void seekPhrase(double progress) {
+    final h = _phraseHandle;
+    final src = _phraseSource;
+    if (h == null || src == null) return;
+    if (!SoLoud.instance.getIsValidVoiceHandle(h)) {
+      _phraseHandle = null;
+      return;
+    }
+    final len = SoLoud.instance.getLength(src);
+    if (len.inMicroseconds <= 0) return;
+    final t = progress.clamp(0.0, 1.0);
+    final us = (len.inMicroseconds * t).round();
+    SoLoud.instance.seek(h, Duration(microseconds: us));
+  }
 }

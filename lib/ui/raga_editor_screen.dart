@@ -56,8 +56,10 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   bool _paused = false;
   /// Which source is active: grid phrase vs waveform strip.
   bool _wavePlayback = false;
-  /// 0–1 playhead progress while audio is active.
-  double _playhead = 0;
+  /// 0–1 playhead within the cropped waveform.
+  double _wavePlayhead = 0;
+  /// 0–1 playhead along the grid phrase.
+  double _gridPlayhead = 0;
   Timer? _playheadTimer;
   bool _ready = false;
   String? _status;
@@ -71,9 +73,26 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   /// Which crop handle is dragged: -1 none, 0 start, 1 end, 2 move range.
   int _cropDrag = -1;
   bool _cropToolActive = true;
+  /// Wave pointer down — click (no drag) seeks the playhead.
+  Offset? _waveDownPos;
+  double _waveDownT = 0;
+  bool _waveDidDrag = false;
+  bool _wavePanning = false;
+  Offset? _wavePanLast;
+  final _waveViewport = WaveformViewport();
+  /// Vertical size of the waveform strip (grid takes the rest).
+  double _waveStripHeight = 96;
+  static const _waveStripMin = 48.0;
+  static const _waveStripMax = 360.0;
+  bool _splitting = false;
+  /// Grid empty-space down — click seeks; drag pans.
+  Offset? _gridDownPos;
+  double _gridDownBeat = 0;
+  bool _gridDidPan = false;
   double? _detectedBpm;
   StreamSubscription<String>? _dropSub;
   bool _dropHighlight = false;
+  static const _clickSlop = 6.0;
 
   static const _palette = <Swara>[
     Swara.sa,
@@ -137,23 +156,59 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
             _playing = false;
             _paused = false;
             _wavePlayback = false;
-            _playhead = 0;
           });
           _playheadTimer?.cancel();
           _playheadTimer = null;
         }
         return;
       }
-      if (p != _playhead) {
-        setState(() => _playhead = p);
-      }
+      setState(() {
+        if (_wavePlayback) {
+          if (p != _wavePlayhead) _wavePlayhead = p;
+        } else {
+          if (p != _gridPlayhead) _gridPlayhead = p;
+        }
+      });
     });
   }
 
   void _stopPlayheadTicker({bool reset = true}) {
     _playheadTimer?.cancel();
     _playheadTimer = null;
-    if (reset) _playhead = 0;
+    if (reset) {
+      _wavePlayhead = 0;
+      _gridPlayhead = 0;
+    }
+  }
+
+  /// Snap waveform playhead to [t] in full-file 0–1 (maps into crop).
+  void _seekWaveToFileT(double fileT) {
+    final span = (_cropEnd - _cropStart).clamp(1e-6, 1.0);
+    final local = ((fileT - _cropStart) / span).clamp(0.0, 1.0);
+    _seekWave(local);
+  }
+
+  /// Snap waveform playhead to [local] 0–1 within the crop.
+  void _seekWave(double local) {
+    final t = local.clamp(0.0, 1.0);
+    final seekAudio = (_playing || _paused) && _wavePlayback;
+    setState(() {
+      _wavePlayhead = t;
+      _wavePlayback = true;
+    });
+    if (seekAudio) _engine.seekPhrase(t);
+  }
+
+  /// Snap grid playhead to absolute [beat].
+  void _seekGrid(double beat) {
+    final total = _raga.totalBeats <= 0 ? 1.0 : _raga.totalBeats;
+    final t = (beat / total).clamp(0.0, 1.0);
+    final seekAudio = (_playing || _paused) && !_wavePlayback;
+    setState(() {
+      _gridPlayhead = t;
+      _wavePlayback = false;
+    });
+    if (seekAudio) _engine.seekPhrase(t);
   }
 
   Future<void> _pickAndImport() async {
@@ -263,6 +318,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _cropEnd = 1;
       _cropToolActive = true;
       _detectedBpm = null;
+      _waveViewport.reset();
+      _wavePlayhead = 0;
       _status =
           'Crop the waveform (${decoded.durationSeconds.toStringAsFixed(1)}s), then Sync';
     });
@@ -316,6 +373,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         _waveform = wave;
         _cropStart = 0;
         _cropEnd = 1;
+        _waveViewport.reset();
+        _wavePlayhead = 0;
         _raga.points
           ..clear()
           ..addAll(points);
@@ -338,29 +397,58 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     }
   }
 
+  void _onWaveScroll(PointerScrollEvent e, Size size) {
+    if (_loadedAudio == null || size.width <= 0) return;
+    final dy = e.scrollDelta.dy;
+    if (dy == 0) return;
+    final factor = dy < 0 ? 1.12 : 1 / 1.12;
+    setState(() {
+      _waveViewport.zoomAt(size: size, local: e.localPosition, factor: factor);
+    });
+  }
+
   void _onWavePointerDown(PointerDownEvent e, Size size) {
-    if (_loadedAudio == null || !_cropToolActive || size.width <= 0) return;
-    final t = (e.localPosition.dx / size.width).clamp(0.0, 1.0);
-    final x0 = _cropStart * size.width;
-    final x1 = _cropEnd * size.width;
-    const hit = 14.0;
-    if ((e.localPosition.dx - x0).abs() <= hit) {
-      _cropDrag = 0;
-    } else if ((e.localPosition.dx - x1).abs() <= hit) {
-      _cropDrag = 1;
-    } else if (e.localPosition.dx >= x0 && e.localPosition.dx <= x1) {
-      _cropDrag = 2;
-      _cropDragAnchor = t;
-      _cropDragStart0 = _cropStart;
-      _cropDragStart1 = _cropEnd;
-    } else {
-      // Click outside → start a new selection from this point.
-      setState(() {
-        _cropStart = t;
-        _cropEnd = t;
+    if (_loadedAudio == null || size.width <= 0) return;
+    if ((e.buttons & kPrimaryMouseButton) == 0) return;
+    final t = _waveViewport.timeAt(e.localPosition, size);
+    _waveDownPos = e.localPosition;
+    _waveDownT = t;
+    _waveDidDrag = false;
+    _wavePanning = false;
+    _wavePanLast = null;
+    _cropDrag = -1;
+
+    if (_cropToolActive) {
+      final x0 = _waveViewport.xFor(_cropStart, size);
+      final x1 = _waveViewport.xFor(_cropEnd, size);
+      const hit = 14.0;
+      if ((e.localPosition.dx - x0).abs() <= hit) {
+        _cropDrag = 0;
+        return;
+      }
+      if ((e.localPosition.dx - x1).abs() <= hit) {
         _cropDrag = 1;
-      });
+        return;
+      }
+      // When zoomed, interior drag must pan — crop often spans the whole
+      // file (0–1), which would otherwise steal every drag as "move crop".
+      final zoomed = _waveViewport.zoom > 1.01;
+      if (!zoomed) {
+        final left = math.min(x0, x1);
+        final right = math.max(x0, x1);
+        if (e.localPosition.dx >= left && e.localPosition.dx <= right) {
+          // Fit view only: drag moves the crop window; click still seeks.
+          _cropDrag = 2;
+          _cropDragAnchor = t;
+          _cropDragStart0 = _cropStart;
+          _cropDragStart1 = _cropEnd;
+          return;
+        }
+      }
     }
+    // Empty space (and zoomed interior): click seeks; drag pans.
+    _wavePanning = true;
+    _wavePanLast = e.localPosition;
   }
 
   double _cropDragAnchor = 0;
@@ -368,8 +456,25 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   double _cropDragStart1 = 1;
 
   void _onWavePointerMove(PointerMoveEvent e, Size size) {
-    if (_cropDrag < 0 || size.width <= 0) return;
-    final t = (e.localPosition.dx / size.width).clamp(0.0, 1.0);
+    if (_waveDownPos == null || size.width <= 0) return;
+    final dist = (e.localPosition - _waveDownPos!).distance;
+    if (dist > _clickSlop) _waveDidDrag = true;
+
+    if (_wavePanning && _wavePanLast != null) {
+      if (!_waveDidDrag) return;
+      final delta = e.localPosition - _wavePanLast!;
+      setState(() {
+        _waveViewport.panBy(size: size, pixelDelta: delta);
+        _wavePanLast = e.localPosition;
+      });
+      return;
+    }
+
+    if (!_cropToolActive || _cropDrag < 0) return;
+    if (!_waveDidDrag && _cropDrag == 2) return; // still a potential click-seek
+
+    final t = _waveViewport.timeAt(e.localPosition, size);
+
     setState(() {
       if (_cropDrag == 0) {
         _cropStart = t.clamp(0.0, _cropEnd - 0.01);
@@ -385,7 +490,29 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     });
   }
 
-  void _onWavePointerUp(PointerUpEvent e) => _cropDrag = -1;
+  void _onWavePointerUp(PointerUpEvent e) {
+    // Click (no drag) → snap blue playhead. Handle / pan drags never seek.
+    final clicked = !_waveDidDrag &&
+        _waveDownPos != null &&
+        _cropDrag != 0 &&
+        _cropDrag != 1;
+    if (clicked) {
+      _seekWaveToFileT(_waveDownT);
+    }
+    _cropDrag = -1;
+    _waveDownPos = null;
+    _waveDidDrag = false;
+    _wavePanning = false;
+    _wavePanLast = null;
+  }
+
+  void _clearWaveDrag() {
+    _cropDrag = -1;
+    _waveDownPos = null;
+    _waveDidDrag = false;
+    _wavePanning = false;
+    _wavePanLast = null;
+  }
 
   List<(double, String)> get _lanes => [
         for (final s in _raga.scale) (s.cents, s.label),
@@ -541,6 +668,10 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     _lastLineTapAt = null;
     _lastLineTapPos = null;
     _autoBendOnDrag = false;
+    // Empty space: click seeks playhead; drag pans.
+    _gridDownPos = e.localPosition;
+    _gridDownBeat = beat;
+    _gridDidPan = false;
     setState(() {
       _dragIndex = null;
       _dragEdgeDest = null;
@@ -563,6 +694,14 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     if ((e.buttons & kPrimaryMouseButton) == 0) return;
 
     if (_panning && _panLast != null) {
+      if (!_gridDidPan) {
+        if (_gridDownPos != null &&
+            (e.localPosition - _gridDownPos!).distance > _clickSlop) {
+          _gridDidPan = true;
+          _panLast = e.localPosition; // commit pan without jump
+        }
+        return;
+      }
       final delta = e.localPosition - _panLast!;
       setState(() {
         _viewport.panBy(raga: _raga, size: size, pixelDelta: delta);
@@ -602,6 +741,12 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   }
 
   void _clearDrag() {
+    // Empty-grid click (no pan) → snap blue playhead to that beat.
+    if (_panning && !_gridDidPan && _gridDownPos != null) {
+      _seekGrid(_gridDownBeat);
+    }
+    _gridDownPos = null;
+    _gridDidPan = false;
     if (_dragIndex != null || _dragEdgeDest != null || _panning) {
       setState(() {
         if (_dragIndex != null || _dragEdgeDest != null) {
@@ -758,13 +903,14 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         label: _raga.id,
       );
       if (!mounted) return;
+      final startAt = _gridPlayhead;
       setState(() {
         _playing = true;
         _paused = false;
         _wavePlayback = false;
-        _playhead = 0;
         _status = null;
       });
+      if (startAt > 0) _engine.seekPhrase(startAt);
       _startPlayheadTicker();
     } catch (e) {
       if (mounted) setState(() => _status = '$e');
@@ -796,6 +942,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     setState(() => _busy = true);
     try {
       final cropped = _croppedAudio();
+      final startAt = _wavePlayhead;
       await _engine.playMono(
         mono: cropped.samples,
         pcmSampleRate: cropped.sampleRate,
@@ -806,9 +953,9 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         _playing = true;
         _paused = false;
         _wavePlayback = true;
-        _playhead = 0;
         _status = null;
       });
+      if (startAt > 0) _engine.seekPhrase(startAt);
       _startPlayheadTicker();
     } catch (e) {
       if (mounted) setState(() => _status = 'Wave play failed: $e');
@@ -825,7 +972,6 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         _playing = false;
         _paused = false;
         _wavePlayback = false;
-        _playhead = 0;
         _busy = false;
       });
     }
@@ -914,7 +1060,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
                 child: Text(
-                  'Drop audio → crop waveform → Sync · click note · zoom · pan · bend handles · right-click empty undo',
+                  'Drop audio → crop → Sync · drag split to resize · scroll zoom · empty-drag pan · click seek · bend · right-click empty undo',
                   style: theme.textTheme.bodyMedium,
                 ),
               ),
@@ -970,9 +1116,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                               laneLabels: _lanes,
                               viewport: _viewport,
                               activeEdgeDest: _dragEdgeDest,
-                              playheadBeat: _playing && !_wavePlayback
-                                  ? _playhead * _raga.totalBeats
-                                  : null,
+                              playheadBeat:
+                                  _gridPlayhead * _raga.totalBeats,
                             ),
                           ),
                         ),
@@ -981,8 +1126,43 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                   ),
                 ),
               ),
+              // Draggable border between grid and waveform.
+              MouseRegion(
+                cursor: SystemMouseCursors.resizeUpDown,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onVerticalDragStart: (_) => setState(() => _splitting = true),
+                  onVerticalDragUpdate: (d) {
+                    setState(() {
+                      _waveStripHeight = (_waveStripHeight - d.delta.dy)
+                          .clamp(_waveStripMin, _waveStripMax);
+                    });
+                  },
+                  onVerticalDragEnd: (_) =>
+                      setState(() => _splitting = false),
+                  onVerticalDragCancel: () =>
+                      setState(() => _splitting = false),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: SizedBox(
+                      height: 10,
+                      child: Center(
+                        child: Container(
+                          height: 3,
+                          decoration: BoxDecoration(
+                            color: _splitting
+                                ? AppColors.gold
+                                : AppColors.mist.withValues(alpha: 0.55),
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
               Padding(
-                padding: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 0),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -1059,18 +1239,23 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                       ],
                     ),
                     SizedBox(
-                      height: 72,
+                      height: _waveStripHeight,
                       child: LayoutBuilder(
                         builder: (context, c) {
                           final size = Size(c.maxWidth, c.maxHeight);
                           return Listener(
                             behavior: HitTestBehavior.opaque,
+                            onPointerSignal: (e) {
+                              if (e is PointerScrollEvent) {
+                                _onWaveScroll(e, size);
+                              }
+                            },
                             onPointerDown: (e) =>
                                 _onWavePointerDown(e, size),
                             onPointerMove: (e) =>
                                 _onWavePointerMove(e, size),
                             onPointerUp: _onWavePointerUp,
-                            onPointerCancel: (_) => _cropDrag = -1,
+                            onPointerCancel: (_) => _clearWaveDrag(),
                             child: CustomPaint(
                               size: size,
                               painter: WaveformPainter(
@@ -1079,9 +1264,10 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                                 cropEnd: _cropEnd,
                                 showSelection: _loadedAudio != null &&
                                     _cropToolActive,
-                                playhead: _playing && _wavePlayback
-                                    ? _playhead
+                                playhead: _loadedAudio != null
+                                    ? _wavePlayhead
                                     : null,
+                                viewport: _waveViewport,
                               ),
                             ),
                           );
@@ -1144,6 +1330,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                             _detectedBpm = null;
                             _cropStart = 0;
                             _cropEnd = 1;
+                            _waveViewport.reset();
+                            _wavePlayhead = 0;
                           }),
                         ),
                       ],

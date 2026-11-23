@@ -5,6 +5,7 @@ import 'package:carnatic_app/music/editable_raga.dart';
 import 'package:carnatic_app/music/swara.dart';
 import 'package:carnatic_app/storage/raga_store.dart';
 import 'package:carnatic_app/ui/raga_grid_painter.dart';
+import 'package:carnatic_app/ui/waveform_painter.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -217,6 +218,27 @@ void main() {
     vp.panBy(raga: r, size: size, pixelDelta: const Offset(40, -30));
     expect(vp.beat0, lessThan(beatBefore));
     expect(vp.cents0, lessThan(centsBefore));
+  });
+
+  test('waveform scroll zoom keeps focus time under the cursor', () {
+    final vp = WaveformViewport();
+    const size = Size(400, 80);
+    const local = Offset(100, 40);
+    final before = vp.timeAt(local, size);
+    vp.zoomAt(size: size, local: local, factor: 4.0);
+    expect(vp.zoom, 4.0);
+    expect(vp.timeAt(local, size), closeTo(before, 1e-6));
+    vp.zoomAt(size: size, local: local, factor: 0.25);
+    expect(vp.zoom, closeTo(1.0, 0.01));
+  });
+
+  test('waveform pan shifts t0 by pixel delta', () {
+    final vp = WaveformViewport(zoom: 4.0, t0: 0.25);
+    vp.clampTo();
+    const size = Size(400, 80);
+    final before = vp.t0;
+    vp.panBy(size: size, pixelDelta: const Offset(40, 0));
+    expect(vp.t0, lessThan(before));
   });
 
   test('raga store round-trips JSON', () async {
