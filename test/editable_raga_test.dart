@@ -241,6 +241,31 @@ void main() {
     expect(vp.t0, lessThan(before));
   });
 
+  test('multi-select move keeps relative spacing', () {
+    final r = EditableRaga.shankarabharanamTemplate()..clearCurve();
+    r.gridLock = false;
+    r.points.addAll([
+      CurvePoint(beat: 1, cents: 0),
+      CurvePoint(beat: 2, cents: 200),
+      CurvePoint(beat: 3, cents: 400),
+    ]);
+    final origins = {
+      0: r.points[0],
+      1: r.points[1],
+      2: r.points[2],
+    };
+    r.movePointsFromOrigins(origins, 0.5, -50);
+    expect(r.points[0].beat, closeTo(1.5, 1e-9));
+    expect(r.points[0].cents, closeTo(-50, 1e-9));
+    expect(r.points[1].beat, closeTo(2.5, 1e-9));
+    expect(r.points[1].cents, closeTo(150, 1e-9));
+    expect(r.points[2].beat, closeTo(3.5, 1e-9));
+    expect(r.points[2].cents, closeTo(350, 1e-9));
+    r.eraseIndices({0, 2});
+    expect(r.points.length, 1);
+    expect(r.points[0].beat, closeTo(2.5, 1e-9));
+  });
+
   test('raga store round-trips JSON', () async {
     final dir = await Directory.systemTemp.createTemp('gamaka_ragas_');
     final store = RagaStore(directory: dir);

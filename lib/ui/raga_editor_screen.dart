@@ -42,11 +42,20 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   int? _dragIndex;
   /// Destination point index when left-dragging an edge curve handle.
   int? _dragEdgeDest;
+  /// Selected grid anchor indices (live list).
+  final Set<int> _selectedPoints = {};
+  /// Origins at multi-select drag start (index → point).
+  Map<int, CurvePoint>? _multiDragOrigins;
+  Offset? _multiDragStartLocal;
   bool _panning = false;
   Offset? _panLast;
   final _viewport = GridViewport();
   final List<String> _undoStack = [];
   static const _maxUndo = 40;
+  /// Last surface used for Space play/pause.
+  bool _focusWave = false;
+  final _editorFocus = FocusNode(debugLabel: 'ragaEditor');
+  final _nameFocus = FocusNode(debugLabel: 'ragaName');
   DateTime? _lastLineTapAt;
   Offset? _lastLineTapPos;
   /// After double-click add on the gold line, drag creates edge bends.
@@ -122,6 +131,9 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     _viewport.clampTo(_raga);
     AudioFileImport.instance.ensureListening();
     _dropSub = AudioFileImport.instance.paths.listen(_importAudioPath);
+    // Global handler so Space/Delete/Ctrl+Z work even after clicking the
+    // CustomPaint (which does not take Flutter focus by itself).
+    HardwareKeyboard.instance.addHandler(_onHardwareKey);
     _bootstrap();
   }
 
@@ -138,11 +150,215 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onHardwareKey);
     _playheadTimer?.cancel();
     _dropSub?.cancel();
     _nameCtrl.dispose();
+    _nameFocus.dispose();
+    _editorFocus.dispose();
     _engine.dispose();
     super.dispose();
+  }
+
+  bool get _isTypingInField => _nameFocus.hasFocus;
+
+  /// Click → make grid/waveform active (Space/Delete target) + reclaim focus.
+  void _activateSurface({required bool wave}) {
+    final changed = _focusWave != wave;
+    _focusWave = wave;
+    // Drop name-field focus so Space is not typed as text / ignored.
+    if (_nameFocus.hasFocus) _nameFocus.unfocus();
+    _editorFocus.requestFocus();
+    if (changed && mounted) {
+      setState(() {});
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _editorFocus.requestFocus();
+      });
+    }
+  }
+
+  bool _isSpaceKey(KeyEvent event) {
+    return event.logicalKey == LogicalKeyboardKey.space ||
+        event.physicalKey == PhysicalKeyboardKey.space ||
+        event.character == ' ';
+  }
+
+  bool _onHardwareKey(KeyEvent event) {
+    // Ignore key-up and auto-repeat (Space would toggle play every tick).
+    if (event is! KeyDownEvent) return false;
+    if (!mounted) return false;
+    if (_isTypingInField) return false;
+
+    final key = event.logicalKey;
+    final ctrl = HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
+
+    if (_isSpaceKey(event)) {
+      _onSpaceShortcut();
+      return true;
+    }
+    if (ctrl && key == LogicalKeyboardKey.keyZ) {
+      _onUndoShortcut();
+      return true;
+    }
+    if (ctrl && key == LogicalKeyboardKey.keyA) {
+      _onSelectAllShortcut();
+      return true;
+    }
+    if (key == LogicalKeyboardKey.delete ||
+        key == LogicalKeyboardKey.backspace) {
+      _onDeleteShortcut();
+      return true;
+    }
+    return false;
+  }
+
+  KeyEventResult _onEditorKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (_isTypingInField) return KeyEventResult.ignored;
+    if (_isSpaceKey(event)) {
+      _onSpaceShortcut();
+      return KeyEventResult.handled;
+    }
+    final key = event.logicalKey;
+    final ctrl = HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
+    if (ctrl && key == LogicalKeyboardKey.keyZ) {
+      _onUndoShortcut();
+      return KeyEventResult.handled;
+    }
+    if (ctrl && key == LogicalKeyboardKey.keyA) {
+      _onSelectAllShortcut();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.delete ||
+        key == LogicalKeyboardKey.backspace) {
+      _onDeleteShortcut();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  void _selectAllPoints() {
+    setState(() {
+      _selectedPoints
+        ..clear()
+        ..addAll(Iterable.generate(_raga.points.length));
+      _status = _selectedPoints.isEmpty
+          ? 'No points to select'
+          : 'Selected ${_selectedPoints.length} points';
+    });
+  }
+
+  /// Select-all for the active surface (grid points or full waveform crop).
+  void _selectAllWaveform() {
+    if (_loadedAudio == null) {
+      setState(() => _status = 'No waveform to select');
+      return;
+    }
+    setState(() {
+      _cropStart = 0;
+      _cropEnd = 1;
+      _cropToolActive = true;
+      _status = 'Waveform selected (full)';
+    });
+  }
+
+  void _onSelectAllShortcut() {
+    if (_isTypingInField) return;
+    if (_focusWave) {
+      _selectAllWaveform();
+    } else {
+      _selectAllPoints();
+    }
+  }
+
+  DateTime? _lastSpaceAt;
+
+  void _onSpaceShortcut() {
+    if (_isTypingInField) return;
+    if (!_ready) {
+      setState(() => _status = 'Audio not ready yet');
+      return;
+    }
+    // Dedupe Focus + HardwareKeyboard both seeing the same key.
+    final now = DateTime.now();
+    if (_lastSpaceAt != null &&
+        now.difference(_lastSpaceAt!) < const Duration(milliseconds: 100)) {
+      return;
+    }
+    _lastSpaceAt = now;
+    // Allow pause/resume even if a prior render left _busy briefly.
+    if (_busy && !_playing) return;
+    if (_focusWave) {
+      if (_loadedAudio == null) {
+        setState(() => _status = 'No waveform loaded');
+        return;
+      }
+      unawaited(_playWaveform());
+    } else {
+      unawaited(_playGrid());
+    }
+  }
+
+  void _onUndoShortcut() {
+    if (_isTypingInField) return;
+    _undoLast();
+  }
+
+  void _onDeleteShortcut() {
+    if (_isTypingInField || _busy) return;
+    if (_focusWave) {
+      _deleteWaveform();
+    } else {
+      _deleteGridSelection();
+    }
+  }
+
+  /// Delete selected grid points; if none selected, clear the whole curve.
+  void _deleteGridSelection() {
+    if (_raga.points.isEmpty) {
+      setState(() => _status = 'Nothing to delete on the grid');
+      return;
+    }
+    _checkpoint();
+    setState(() {
+      if (_selectedPoints.isNotEmpty) {
+        final n = _selectedPoints.length;
+        _raga.eraseIndices(_selectedPoints);
+        _selectedPoints.clear();
+        _status = 'Deleted $n point${n == 1 ? '' : 's'}';
+      } else {
+        _raga.clearCurve();
+        _selectedPoints.clear();
+        _status = 'Cleared grid points';
+      }
+      _dragIndex = null;
+      _dragEdgeDest = null;
+      _multiDragOrigins = null;
+      _multiDragStartLocal = null;
+    });
+  }
+
+  /// Remove loaded waveform (crop/Sync source). Does not erase the grid.
+  void _deleteWaveform() {
+    if (_loadedAudio == null && _waveform.isEmpty) {
+      setState(() => _status = 'No waveform to delete');
+      return;
+    }
+    if (_playing && _wavePlayback) {
+      unawaited(_stop());
+    }
+    setState(() {
+      _waveform = Float32List(0);
+      _loadedAudio = null;
+      _cropStart = 0;
+      _cropEnd = 1;
+      _waveViewport.reset();
+      _wavePlayhead = 0;
+      _detectedBpm = _raga.points.isEmpty ? null : _detectedBpm;
+      _status = 'Waveform removed';
+    });
   }
 
   void _startPlayheadTicker() {
@@ -352,11 +568,11 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       final cropped = _croppedAudio();
       // Refresh waveform to the cropped region.
       final wave = waveformPeaks(cropped.samples, buckets: 480);
+      // Do not force engine Sa — detect tonic from the recording.
       final map = await compute(_importIsolate, <String, Object>{
         'samples': cropped.samples,
         'sampleRate': cropped.sampleRate,
         'durationSeconds': cropped.durationSeconds,
-        'saHz': _engine.saHz,
       });
       if (!mounted) return;
       final pointsJson = (map['points'] as List).cast<Map<dynamic, dynamic>>();
@@ -367,6 +583,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       final bpm = (map['bpm'] as num).toDouble();
       final totalBeats = (map['totalBeats'] as num).toDouble();
       final saHz = (map['saHz'] as num).toDouble();
+      final phaseBeats = (map['beatPhaseBeats'] as num?)?.toDouble() ?? 0;
       _checkpoint();
       setState(() {
         _loadedAudio = cropped;
@@ -380,14 +597,18 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
           ..addAll(points);
         _raga.beatsPerMinute = bpm;
         _raga.totalBeats = totalBeats;
-        _raga.gridLock = false;
+        _raga.gridLock = true;
+        _raga.toneSnap = ToneSnap.mini;
         _detectedBpm = bpm;
         _viewport.zoom = 1.0;
         _viewport.beat0 = 0;
         _viewport.cents0 = _raga.minCents;
         _viewport.clampTo(_raga);
+        final phaseMs = phaseBeats > 0.02
+            ? ' · pickup ${(phaseBeats * 60 / bpm * 1000).round()} ms'
+            : '';
         _status =
-            'Synced → ${points.length} points · ${bpm.toStringAsFixed(1)} BPM';
+            'Synced → ${points.length} points · Sa ${saHz.toStringAsFixed(0)} Hz · ${bpm.toStringAsFixed(1)} BPM · grid lock$phaseMs';
       });
       await _engine.setSaHz(saHz);
     } catch (e) {
@@ -408,6 +629,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   }
 
   void _onWavePointerDown(PointerDownEvent e, Size size) {
+    _activateSurface(wave: true);
     if (_loadedAudio == null || size.width <= 0) return;
     if ((e.buttons & kPrimaryMouseButton) == 0) return;
     final t = _waveViewport.timeAt(e.localPosition, size);
@@ -539,10 +761,31 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _nameCtrl.text = _raga.name;
       _dragIndex = null;
       _dragEdgeDest = null;
+      _multiDragOrigins = null;
+      _multiDragStartLocal = null;
+      _selectedPoints.clear();
       _panning = false;
       _panLast = null;
       _status = 'Undid last change';
     });
+  }
+
+  void _remapSelectionAfterSort(Iterable<CurvePoint> kept) {
+    final keys = kept
+        .map((p) => (p.beat, p.cents, p.bendBeat, p.bendCents))
+        .toSet();
+    _selectedPoints
+      ..clear()
+      ..addAll([
+        for (var i = 0; i < _raga.points.length; i++)
+          if (keys.contains((
+            _raga.points[i].beat,
+            _raga.points[i].cents,
+            _raga.points[i].bendBeat,
+            _raga.points[i].bendCents,
+          )))
+            i,
+      ]);
   }
 
   void _onScroll(PointerScrollEvent e, Size size) {
@@ -560,6 +803,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   }
 
   void _onPointerDown(PointerDownEvent e, Size size) {
+    _activateSurface(wave: false);
     final map = _mapper(size);
     final beat = map.beatAt(e.localPosition);
     final cents = map.centsAt(e.localPosition);
@@ -576,6 +820,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       // Right-click empty grid (not on point/handle/line) → undo.
       _dragIndex = null;
       _dragEdgeDest = null;
+      _multiDragOrigins = null;
+      _multiDragStartLocal = null;
       _panning = false;
       _panLast = null;
       _autoBendOnDrag = false;
@@ -590,9 +836,18 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     if (_tool == _EditTool.eraser) {
       _checkpoint();
       setState(() {
-        _raga.eraseNear(beat, cents);
+        if (_selectedPoints.isNotEmpty &&
+            (hitPoint == null || _selectedPoints.contains(hitPoint))) {
+          _raga.eraseIndices(_selectedPoints);
+          _selectedPoints.clear();
+        } else {
+          _raga.eraseNear(beat, cents);
+          _selectedPoints.clear();
+        }
         _dragIndex = null;
         _dragEdgeDest = null;
+        _multiDragOrigins = null;
+        _multiDragStartLocal = null;
         _panning = false;
         _panLast = null;
         _autoBendOnDrag = false;
@@ -611,11 +866,28 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       if (_ready) {
         unawaited(_engine.previewCents(noteCents));
       }
+      final keepMulti =
+          _selectedPoints.length > 1 && _selectedPoints.contains(hitPoint);
       setState(() {
+        if (!keepMulti) {
+          _selectedPoints
+            ..clear()
+            ..add(hitPoint);
+        }
         _dragIndex = hitPoint;
         _dragEdgeDest = null;
         _panning = false;
         _panLast = null;
+        if (_selectedPoints.length > 1) {
+          _multiDragOrigins = {
+            for (final i in _selectedPoints)
+              if (i >= 0 && i < _raga.points.length) i: _raga.points[i],
+          };
+          _multiDragStartLocal = e.localPosition;
+        } else {
+          _multiDragOrigins = null;
+          _multiDragStartLocal = null;
+        }
         _status = null;
       });
       return;
@@ -627,8 +899,11 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _autoBendOnDrag = false;
       _checkpoint();
       setState(() {
+        _selectedPoints.clear();
         _dragIndex = null;
         _dragEdgeDest = hitHandle;
+        _multiDragOrigins = null;
+        _multiDragStartLocal = null;
         _panning = false;
         _panLast = null;
         _raga.setEdgeBend(hitHandle, beat, cents);
@@ -651,8 +926,13 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         final idx =
             _raga.addPoint(CurvePoint(beat: beat, cents: cents));
         setState(() {
+          _selectedPoints
+            ..clear()
+            ..addAll(idx >= 0 ? [idx] : const <int>[]);
           _dragIndex = idx >= 0 ? idx : null;
           _dragEdgeDest = null;
+          _multiDragOrigins = null;
+          _multiDragStartLocal = null;
           _panning = false;
           _panLast = null;
           _autoBendOnDrag = idx >= 0;
@@ -668,13 +948,16 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     _lastLineTapAt = null;
     _lastLineTapPos = null;
     _autoBendOnDrag = false;
-    // Empty space: click seeks playhead; drag pans.
+    // Empty space: click seeks playhead; drag pans. Clears multi-selection.
     _gridDownPos = e.localPosition;
     _gridDownBeat = beat;
     _gridDidPan = false;
     setState(() {
+      _selectedPoints.clear();
       _dragIndex = null;
       _dragEdgeDest = null;
+      _multiDragOrigins = null;
+      _multiDragStartLocal = null;
       _panning = true;
       _panLast = e.localPosition;
       _status = null;
@@ -723,6 +1006,19 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       return;
     }
 
+    final origins = _multiDragOrigins;
+    final startLocal = _multiDragStartLocal;
+    if (origins != null && origins.length > 1 && startLocal != null) {
+      final startBeat = map.beatAt(startLocal);
+      final startCents = map.centsAt(startLocal);
+      final dBeat = map.beatAt(e.localPosition) - startBeat;
+      final dCents = map.centsAt(e.localPosition) - startCents;
+      setState(() {
+        _raga.movePointsFromOrigins(origins, dBeat, dCents);
+      });
+      return;
+    }
+
     final idx = _dragIndex;
     if (idx == null) return;
 
@@ -750,10 +1046,19 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     if (_dragIndex != null || _dragEdgeDest != null || _panning) {
       setState(() {
         if (_dragIndex != null || _dragEdgeDest != null) {
+          final kept = [
+            for (final i in _selectedPoints)
+              if (i >= 0 && i < _raga.points.length) _raga.points[i],
+          ];
           _raga.sortPoints();
+          if (kept.isNotEmpty) {
+            _remapSelectionAfterSort(kept);
+          }
         }
         _dragIndex = null;
         _dragEdgeDest = null;
+        _multiDragOrigins = null;
+        _multiDragStartLocal = null;
         _panning = false;
         _panLast = null;
         _autoBendOnDrag = false;
@@ -875,6 +1180,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   Future<void> _playGrid() async {
     if (!_ready || _busy) return;
     _syncPlayStateFromEngine();
+    // Pause/resume only when grid audio is already the active source.
     if (_playing && !_wavePlayback) {
       if (_paused) {
         _engine.resumePhrase();
@@ -896,14 +1202,25 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       setState(() => _status = 'Add points first (double-click the gold line).');
       return;
     }
-    setState(() => _busy = true);
+    // Claim busy immediately so Space/wave cannot start a parallel play.
+    _busy = true;
+    setState(() {
+      _wavePlayback = false;
+      _status = 'Playing grid…';
+    });
     try {
-      await _engine.playEnvelope(
+      // Switching from waveform → stop wave voice before synth render.
+      if (_playing) await _engine.stopPhrase();
+      final startAt = _gridPlayhead;
+      final played = await _engine.playEnvelope(
         _raga.toEnvelope(),
         label: _raga.id,
       );
       if (!mounted) return;
-      final startAt = _gridPlayhead;
+      if (played == null) {
+        setState(() => _status = 'Grid play cancelled');
+        return;
+      }
       setState(() {
         _playing = true;
         _paused = false;
@@ -922,6 +1239,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   Future<void> _playWaveform() async {
     if (!_ready || _busy || _loadedAudio == null) return;
     _syncPlayStateFromEngine();
+    // Pause/resume only when waveform audio is already the active source.
     if (_playing && _wavePlayback) {
       if (_paused) {
         _engine.resumePhrase();
@@ -939,8 +1257,15 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       }
       return;
     }
-    setState(() => _busy = true);
+    _busy = true;
+    setState(() {
+      _wavePlayback = true;
+      _status = 'Playing waveform…';
+    });
     try {
+      // Switching from grid → hard-stop synth so it cannot keep sounding
+      // under the waveform playhead.
+      await _engine.stopPhrase();
       final cropped = _croppedAudio();
       final startAt = _wavePlayhead;
       await _engine.playMono(
@@ -958,7 +1283,13 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       if (startAt > 0) _engine.seekPhrase(startAt);
       _startPlayheadTicker();
     } catch (e) {
-      if (mounted) setState(() => _status = 'Wave play failed: $e');
+      if (mounted) {
+        setState(() {
+          _status = 'Wave play failed: $e';
+          _wavePlayback = false;
+          _playing = false;
+        });
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -982,6 +1313,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _raga = EditableRaga.decode(r.encode());
       _nameCtrl.text = _raga.name;
       _detectedBpm = _raga.beatsPerMinute;
+      _selectedPoints.clear();
       _viewport.zoom = 1.0;
       _viewport.beat0 = 0;
       _viewport.cents0 = _raga.minCents;
@@ -995,137 +1327,214 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     final theme = Theme.of(context);
 
     return Scaffold(
-      body: Container(
-        width: double.infinity,
-        height: double.infinity,
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [Color(0xFF1A3A3C), AppColors.teakDeep],
-          ),
-        ),
-        child: SafeArea(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(8, 4, 16, 0),
-                child: Row(
-                  children: [
-                    IconButton(
-                      onPressed: () => Navigator.of(context).maybePop(),
-                      icon: const Icon(Icons.arrow_back, color: AppColors.sand),
-                    ),
-                    Expanded(
-                      child: Text('Raga editor',
-                          style: theme.textTheme.headlineMedium),
-                    ),
-                    if (_detectedBpm != null)
-                      Padding(
-                        padding: const EdgeInsets.only(right: 8),
-                        child: Text(
-                          '${_detectedBpm!.toStringAsFixed(_detectedBpm! == _detectedBpm!.roundToDouble() ? 0 : 1)} BPM',
-                          style: theme.textTheme.titleMedium?.copyWith(
-                            color: AppColors.gold,
-                            fontWeight: FontWeight.w700,
-                          ),
+      body: Focus(
+        focusNode: _editorFocus,
+        autofocus: true,
+        onKeyEvent: _onEditorKeyEvent,
+        child: Container(
+            width: double.infinity,
+            height: double.infinity,
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Color(0xFF1A3A3C), AppColors.teakDeep],
+              ),
+            ),
+            child: SafeArea(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 4, 16, 0),
+                    child: Row(
+                      children: [
+                        IconButton(
+                          onPressed: () => Navigator.of(context).maybePop(),
+                          icon: const Icon(Icons.arrow_back,
+                              color: AppColors.sand),
                         ),
-                      ),
-                    _WaveIconBtn(
-                      icon: _playing && !_wavePlayback && !_paused
-                          ? Icons.pause
-                          : Icons.play_arrow,
-                      tooltip: _playing && !_wavePlayback && !_paused
-                          ? 'Pause grid'
-                          : 'Play grid',
-                      selected: _playing && !_wavePlayback,
-                      onTap: _ready && !_busy ? _playGrid : null,
-                    ),
-                    _WaveIconBtn(
-                      icon: Icons.stop,
-                      tooltip: 'Stop',
-                      selected: _playing,
-                      onTap: _playing || _paused ? _stop : null,
-                    ),
-                    _WaveIconBtn(
-                      icon: Icons.save,
-                      tooltip: 'Save waveform / grid',
-                      selected: true,
-                      onTap: _busy ? null : _promptSaveDialog,
-                    ),
-                  ],
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Text(
-                  'Drop audio → crop → Sync · drag split to resize · scroll zoom · empty-drag pan · click seek · bend · right-click empty undo',
-                  style: theme.textTheme.bodyMedium,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: TextField(
-                  controller: _nameCtrl,
-                  style: theme.textTheme.titleLarge,
-                  decoration: InputDecoration(
-                    labelText: 'Raga name',
-                    labelStyle: theme.textTheme.labelLarge,
-                    enabledBorder: const UnderlineInputBorder(
-                      borderSide: BorderSide(color: AppColors.mist),
-                    ),
-                    focusedBorder: const UnderlineInputBorder(
-                      borderSide: BorderSide(color: AppColors.gold),
-                    ),
-                  ),
-                  onChanged: (v) => _raga.name = v,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Expanded(
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  child: LayoutBuilder(
-                    builder: (context, constraints) {
-                      final size =
-                          Size(constraints.maxWidth, constraints.maxHeight);
-                      return DecoratedBox(
-                        decoration: BoxDecoration(
-                          border: Border.all(
-                            color: _dropHighlight
-                                ? AppColors.gold
-                                : Colors.transparent,
-                            width: 2,
-                          ),
+                        Expanded(
+                          child: Text('Raga editor',
+                              style: theme.textTheme.headlineMedium),
                         ),
-                        child: Listener(
-                          behavior: HitTestBehavior.opaque,
-                          onPointerSignal: (e) {
-                            if (e is PointerScrollEvent) _onScroll(e, size);
-                          },
-                          onPointerDown: (e) => _onPointerDown(e, size),
-                          onPointerMove: (e) => _onPointerMove(e, size),
-                          onPointerUp: _onPointerUp,
-                          onPointerCancel: (_) => _clearDrag(),
-                          child: CustomPaint(
-                            size: size,
-                            painter: RagaGridPainter(
-                              raga: _raga,
-                              laneLabels: _lanes,
-                              viewport: _viewport,
-                              activeEdgeDest: _dragEdgeDest,
-                              playheadBeat:
-                                  _gridPlayhead * _raga.totalBeats,
+                        if (_detectedBpm != null)
+                          Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: Text(
+                              '${_detectedBpm!.toStringAsFixed(_detectedBpm! == _detectedBpm!.roundToDouble() ? 0 : 1)} BPM',
+                              style: theme.textTheme.titleMedium?.copyWith(
+                                color: AppColors.gold,
+                                fontWeight: FontWeight.w700,
+                              ),
                             ),
                           ),
-                        ),
-                      );
-                    },
+                      ],
+                    ),
                   ),
-                ),
-              ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    child: Text(
+                      'Click to activate · Space play · Ctrl+A select all · Delete · Ctrl+Z undo',
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    child: TextField(
+                      controller: _nameCtrl,
+                      focusNode: _nameFocus,
+                      style: theme.textTheme.titleLarge,
+                      decoration: InputDecoration(
+                        labelText: 'Raga name',
+                        labelStyle: theme.textTheme.labelLarge,
+                        enabledBorder: const UnderlineInputBorder(
+                          borderSide: BorderSide(color: AppColors.mist),
+                        ),
+                        focusedBorder: const UnderlineInputBorder(
+                          borderSide: BorderSide(color: AppColors.gold),
+                        ),
+                      ),
+                      onChanged: (v) => _raga.name = v,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 0),
+                    child: Row(
+                      children: [
+                        _WaveIconBtn(
+                          icon: _playing && !_wavePlayback && !_paused
+                              ? Icons.pause
+                              : Icons.play_arrow,
+                          tooltip: _playing && !_wavePlayback && !_paused
+                              ? 'Pause grid (Space)'
+                              : 'Play grid (Space)',
+                          selected: _playing && !_wavePlayback,
+                          onTap: _ready && !_busy
+                              ? () {
+                                  _activateSurface(wave: false);
+                                  unawaited(_playGrid());
+                                }
+                              : null,
+                        ),
+                        _WaveIconBtn(
+                          icon: Icons.stop,
+                          tooltip: 'Stop',
+                          selected: _playing && !_wavePlayback,
+                          onTap: _playing || _paused ? _stop : null,
+                        ),
+                        _WaveIconBtn(
+                          icon: Icons.undo,
+                          tooltip: 'Undo (Ctrl+Z)',
+                          onTap: _undoStack.isEmpty ? null : _undoLast,
+                        ),
+                        _WaveIconBtn(
+                          icon: Icons.select_all,
+                          tooltip: 'Select all points (Ctrl+A)',
+                          selected: _selectedPoints.isNotEmpty &&
+                              _selectedPoints.length == _raga.points.length &&
+                              _raga.points.isNotEmpty,
+                          onTap: _raga.points.isEmpty
+                              ? null
+                              : () {
+                                  _activateSurface(wave: false);
+                                  _selectAllPoints();
+                                },
+                        ),
+                        _WaveIconBtn(
+                          icon: Icons.delete_outline,
+                          tooltip:
+                              'Delete selection (Delete) · no selection clears grid',
+                          onTap: _raga.points.isEmpty
+                              ? null
+                              : () {
+                                  _activateSurface(wave: false);
+                                  _deleteGridSelection();
+                                },
+                        ),
+                        _WaveIconBtn(
+                          icon: Icons.save,
+                          tooltip: 'Save waveform / grid',
+                          selected: true,
+                          onTap: _busy ? null : _promptSaveDialog,
+                        ),
+                        const Spacer(),
+                        Text(
+                          _focusWave ? '' : 'ACTIVE',
+                          style: theme.textTheme.labelLarge?.copyWith(
+                            color: AppColors.gold,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.6,
+                          ),
+                        ),
+                        if (_selectedPoints.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 10),
+                            child: Text(
+                              '${_selectedPoints.length} selected',
+                              style: theme.textTheme.labelLarge?.copyWith(
+                                color: AppColors.goldSoft,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          final size = Size(
+                              constraints.maxWidth, constraints.maxHeight);
+                          final gridActive = !_focusWave;
+                          return DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: gridActive
+                                  ? Colors.white.withValues(alpha: 0.07)
+                                  : Colors.black.withValues(alpha: 0.12),
+                              border: Border.all(
+                                color: _dropHighlight
+                                    ? AppColors.gold
+                                    : gridActive
+                                        ? AppColors.gold.withValues(alpha: 0.45)
+                                        : Colors.transparent,
+                                width: gridActive ? 1.5 : 1,
+                              ),
+                            ),
+                            child: Listener(
+                              behavior: HitTestBehavior.opaque,
+                              onPointerSignal: (e) {
+                                if (e is PointerScrollEvent) {
+                                  _onScroll(e, size);
+                                }
+                              },
+                              onPointerDown: (e) => _onPointerDown(e, size),
+                              onPointerMove: (e) => _onPointerMove(e, size),
+                              onPointerUp: _onPointerUp,
+                              onPointerCancel: (_) => _clearDrag(),
+                              child: CustomPaint(
+                                size: size,
+                                painter: RagaGridPainter(
+                                  raga: _raga,
+                                  laneLabels: _lanes,
+                                  viewport: _viewport,
+                                  activeEdgeDest: _dragEdgeDest,
+                                  playheadBeat:
+                                      _gridPlayhead * _raga.totalBeats,
+                                  selectedIndices: Set<int>.from(
+                                    _selectedPoints,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
               // Draggable border between grid and waveform.
               MouseRegion(
                 cursor: SystemMouseCursors.resizeUpDown,
@@ -1177,7 +1586,10 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                               : 'Play waveform',
                           selected: _playing && _wavePlayback,
                           onTap: _loadedAudio != null && _ready && !_busy
-                              ? _playWaveform
+                              ? () {
+                                  _activateSurface(wave: true);
+                                  unawaited(_playWaveform());
+                                }
                               : null,
                         ),
                         _WaveIconBtn(
@@ -1198,14 +1610,13 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                         ),
                         _WaveIconBtn(
                           icon: Icons.crop_free,
-                          tooltip: 'Select all',
+                          tooltip: 'Select all (Ctrl+A)',
                           onTap: _loadedAudio == null
                               ? null
-                              : () => setState(() {
-                                    _cropStart = 0;
-                                    _cropEnd = 1;
-                                    _cropToolActive = true;
-                                  }),
+                              : () {
+                                  _activateSurface(wave: true);
+                                  _selectAllWaveform();
+                                },
                         ),
                         _WaveIconBtn(
                           icon: Icons.restart_alt,
@@ -1223,11 +1634,30 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                           onTap: _busy ? null : _promptYoutubeUrl,
                         ),
                         _WaveIconBtn(
+                          icon: Icons.delete_outline,
+                          tooltip: 'Delete waveform (Delete)',
+                          onTap: _loadedAudio == null && _waveform.isEmpty
+                              ? null
+                              : () {
+                                  _activateSurface(wave: true);
+                                  _deleteWaveform();
+                                },
+                        ),
+                        _WaveIconBtn(
                           icon: Icons.save_alt,
                           tooltip: 'Save waveform / grid',
                           onTap: _busy ? null : _promptSaveDialog,
                         ),
                         const Spacer(),
+                        Text(
+                          _focusWave ? 'ACTIVE' : '',
+                          style: theme.textTheme.labelLarge?.copyWith(
+                            color: AppColors.gold,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 0.6,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
                         _WaveIconBtn(
                           icon: Icons.sync,
                           tooltip: 'Sync crop → grid',
@@ -1238,40 +1668,53 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                         ),
                       ],
                     ),
-                    SizedBox(
-                      height: _waveStripHeight,
-                      child: LayoutBuilder(
-                        builder: (context, c) {
-                          final size = Size(c.maxWidth, c.maxHeight);
-                          return Listener(
-                            behavior: HitTestBehavior.opaque,
-                            onPointerSignal: (e) {
-                              if (e is PointerScrollEvent) {
-                                _onWaveScroll(e, size);
-                              }
-                            },
-                            onPointerDown: (e) =>
-                                _onWavePointerDown(e, size),
-                            onPointerMove: (e) =>
-                                _onWavePointerMove(e, size),
-                            onPointerUp: _onWavePointerUp,
-                            onPointerCancel: (_) => _clearWaveDrag(),
-                            child: CustomPaint(
-                              size: size,
-                              painter: WaveformPainter(
-                                peaks: _waveform,
-                                cropStart: _cropStart,
-                                cropEnd: _cropEnd,
-                                showSelection: _loadedAudio != null &&
-                                    _cropToolActive,
-                                playhead: _loadedAudio != null
-                                    ? _wavePlayhead
-                                    : null,
-                                viewport: _waveViewport,
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: _focusWave
+                            ? Colors.white.withValues(alpha: 0.07)
+                            : Colors.black.withValues(alpha: 0.12),
+                        border: Border.all(
+                          color: _focusWave
+                              ? AppColors.gold.withValues(alpha: 0.45)
+                              : Colors.transparent,
+                          width: _focusWave ? 1.5 : 1,
+                        ),
+                      ),
+                      child: SizedBox(
+                        height: _waveStripHeight,
+                        child: LayoutBuilder(
+                          builder: (context, c) {
+                            final size = Size(c.maxWidth, c.maxHeight);
+                            return Listener(
+                              behavior: HitTestBehavior.opaque,
+                              onPointerSignal: (e) {
+                                if (e is PointerScrollEvent) {
+                                  _onWaveScroll(e, size);
+                                }
+                              },
+                              onPointerDown: (e) =>
+                                  _onWavePointerDown(e, size),
+                              onPointerMove: (e) =>
+                                  _onWavePointerMove(e, size),
+                              onPointerUp: _onWavePointerUp,
+                              onPointerCancel: (_) => _clearWaveDrag(),
+                              child: CustomPaint(
+                                size: size,
+                                painter: WaveformPainter(
+                                  peaks: _waveform,
+                                  cropStart: _cropStart,
+                                  cropEnd: _cropEnd,
+                                  showSelection: _loadedAudio != null &&
+                                      _cropToolActive,
+                                  playhead: _loadedAudio != null
+                                      ? _wavePlayhead
+                                      : null,
+                                  viewport: _waveViewport,
+                                ),
                               ),
-                            ),
-                          );
-                        },
+                            );
+                          },
+                        ),
                       ),
                     ),
                   ],
@@ -1460,6 +1903,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
           ),
         ),
       ),
+    ),
     );
   }
 }
@@ -1469,16 +1913,17 @@ Map<String, Object> _importIsolate(Map<String, Object> args) {
   final samples = args['samples'] as Float32List;
   final sampleRate = args['sampleRate'] as int;
   final durationSeconds = args['durationSeconds'] as double;
-  final saHzHint = args['saHz'] as double;
   final decoded = DecodedAudio(
     samples: samples,
     sampleRate: sampleRate,
     durationSeconds: durationSeconds,
   );
-  final imported = importVoiceToCurve(decoded, saHzHint: saHzHint);
+  // Auto-detect Sa from pitch (engine Sa was wrongly forcing 220 Hz).
+  final imported = importVoiceToCurve(decoded);
   return {
     'points': [for (final p in imported.points) p.toJson()],
     'bpm': imported.beatsPerMinute,
+    'beatPhaseBeats': imported.beatPhaseBeats,
     'totalBeats': imported.totalBeats,
     'saHz': imported.saHz,
     'waveform': imported.waveform,
@@ -1671,20 +2116,24 @@ class _WaveIconBtn extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final enabled = onTap != null;
-    return IconButton(
-      tooltip: tooltip,
-      onPressed: onTap,
-      icon: Icon(
-        icon,
-        size: 20,
-        color: !enabled
-            ? AppColors.mist.withValues(alpha: 0.35)
-            : selected
-                ? AppColors.gold
-                : AppColors.sand,
+    // Keep toolbar icons from taking keyboard focus — otherwise Space
+    // activates the focused button instead of play/pause.
+    return ExcludeFocus(
+      child: IconButton(
+        tooltip: tooltip,
+        onPressed: onTap,
+        icon: Icon(
+          icon,
+          size: 20,
+          color: !enabled
+              ? AppColors.mist.withValues(alpha: 0.35)
+              : selected
+                  ? AppColors.gold
+                  : AppColors.sand,
+        ),
+        padding: const EdgeInsets.all(6),
+        constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
       ),
-      padding: const EdgeInsets.all(6),
-      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
     );
   }
 }

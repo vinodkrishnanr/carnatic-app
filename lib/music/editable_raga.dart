@@ -215,6 +215,31 @@ class EditableRaga {
     );
   }
 
+  /// Move several points by the same Δbeat/Δcents from [origins] (multi-select drag).
+  void movePointsFromOrigins(
+    Map<int, CurvePoint> origins,
+    double dBeat,
+    double dCents,
+  ) {
+    for (final e in origins.entries) {
+      final i = e.key;
+      if (i < 0 || i >= points.length) continue;
+      final o = e.value;
+      movePoint(
+        i,
+        CurvePoint(beat: o.beat + dBeat, cents: o.cents + dCents, amp: o.amp),
+      );
+    }
+  }
+
+  /// Remove points at [indices] (highest index first).
+  void eraseIndices(Set<int> indices) {
+    final ordered = indices.toList()..sort((a, b) => b.compareTo(a));
+    for (final i in ordered) {
+      if (i >= 0 && i < points.length) points.removeAt(i);
+    }
+  }
+
   /// Next point in beat order after [fromIndex], or null.
   int? nextPointIndex(int fromIndex) {
     if (fromIndex < 0 || fromIndex >= points.length) return null;
@@ -433,6 +458,25 @@ class EditableRaga {
             next,
             u,
           );
+          final t = tPrev + (tNext - tPrev) * u;
+          final amp = s == n ? noteAmp : sustain;
+          addAt(t, cents, amp);
+        }
+      } else if (isSounding(prev) &&
+          isSounding(next) &&
+          (next.beat - prev.beat) < 0.35) {
+        // Dense imported / continuous chain without an explicit bend: linear
+        // pitch glide at sustain (not mute→re-attack). Manual Sa–Sa still uses
+        // the stepped path when beats are farther apart.
+        final tPrev = math.max(out.last.seconds, prev.beat * beatSeconds);
+        final n = math.max(8, curveSamples ~/ 2);
+        final sustain = math.max(
+          out.isNotEmpty ? out.last.amp : prev.amp,
+          math.max(noteAmp, 0.85),
+        );
+        for (var s = 1; s <= n; s++) {
+          final u = s / n;
+          final cents = prev.cents + (next.cents - prev.cents) * u;
           final t = tPrev + (tNext - tPrev) * u;
           final amp = s == n ? noteAmp : sustain;
           addAt(t, cents, amp);

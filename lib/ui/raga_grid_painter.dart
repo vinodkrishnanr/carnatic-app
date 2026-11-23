@@ -100,6 +100,8 @@ class RagaGridPainter extends CustomPainter {
     this.activeEdgeDest,
     /// Absolute beat position of the playhead; null hides it.
     this.playheadBeat,
+    /// Live-list indices of selected anchor points (highlighted).
+    this.selectedIndices = const {},
   });
 
   final EditableRaga raga;
@@ -109,6 +111,7 @@ class RagaGridPainter extends CustomPainter {
   /// Destination point index of the edge being bent (highlight).
   final int? activeEdgeDest;
   final double? playheadBeat;
+  final Set<int> selectedIndices;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -278,8 +281,27 @@ class RagaGridPainter extends CustomPainter {
     }
 
     final dot = Paint()..color = AppColors.goldSoft;
+    final selectedFill = Paint()..color = AppColors.gold;
+    final selectedRing = Paint()
+      ..color = const Color(0xFF0088FF)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
     for (final p in pts) {
-      canvas.drawCircle(Offset(xFor(p.beat), yFor(p.cents)), 3.2, dot);
+      final liveIdx = raga.points.indexWhere(
+        (q) =>
+            identical(q, p) ||
+            (q.beat == p.beat &&
+                q.cents == p.cents &&
+                q.bendBeat == p.bendBeat &&
+                q.bendCents == p.bendCents),
+      );
+      final selected =
+          liveIdx >= 0 && selectedIndices.contains(liveIdx);
+      final center = Offset(xFor(p.beat), yFor(p.cents));
+      canvas.drawCircle(center, selected ? 5.0 : 3.2, selected ? selectedFill : dot);
+      if (selected) {
+        canvas.drawCircle(center, 7.0, selectedRing);
+      }
     }
 
     final ph = playheadBeat;

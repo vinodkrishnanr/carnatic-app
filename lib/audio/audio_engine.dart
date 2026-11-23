@@ -50,6 +50,9 @@ class AudioEngine {
   AudioSource? _phraseSource;
   SoundHandle? _phraseHandle;
 
+  /// Bumped on every play/stop so an in-flight render cannot overwrite a newer play.
+  int _playEpoch = 0;
+
   double saHz = 220.0;
 
   final Map<String, PhraseRenderResult> _cache = {};
@@ -170,12 +173,14 @@ class AudioEngine {
   }
 
   /// Play an arbitrary pitch envelope (raga editor curves).
-  Future<PhraseRenderResult> playEnvelope(
+  Future<PhraseRenderResult?> playEnvelope(
     TimedPitchEnvelope envelope, {
     String label = 'curve',
   }) async {
     if (!_ready) await init();
+    final epoch = ++_playEpoch;
     await stopPhrase();
+    if (epoch != _playEpoch) return null;
 
     final pts = envelope.points;
     final seconds = Float64List(pts.length);
@@ -195,13 +200,16 @@ class AudioEngine {
       'saHz': saHz,
       'sampleRate': sampleRate,
     });
+    // A newer playMono/playEnvelope/stop invalidated this render.
+    if (epoch != _playEpoch) return null;
 
     final result = PhraseRenderResult(
       pcm: pcm,
       envelope: envelope,
       plot: envelope.downsample(count: 240),
     );
-    await _playPcm(pcm, label: label);
+    await _playPcm(pcm, label: label, epoch: epoch);
+    if (epoch != _playEpoch) return null;
     return result;
   }
 
@@ -212,30 +220,59 @@ class AudioEngine {
     String label = 'wave',
   }) async {
     if (!_ready) await init();
+    final epoch = ++_playEpoch;
     await stopPhrase();
+    if (epoch != _playEpoch) return;
     final wav = encodeWavMonoInt16(mono: mono, sampleRate: pcmSampleRate);
-    await _playWavBytes(wav, label: label);
+    await _playWavBytes(wav, label: label, epoch: epoch);
   }
 
-  Future<void> _playPcm(Float32List pcm, {required String label}) async {
+  Future<void> _playPcm(
+    Float32List pcm, {
+    required String label,
+    int? epoch,
+  }) async {
     final wav = encodeWavInt16(
       interleavedStereo: pcm,
       sampleRate: sampleRate,
     );
-    await _playWavBytes(wav, label: label);
+    await _playWavBytes(wav, label: label, epoch: epoch);
   }
 
-  Future<void> _playWavBytes(Uint8List wav, {required String label}) async {
+  Future<void> _playWavBytes(
+    Uint8List wav, {
+    required String label,
+    int? epoch,
+  }) async {
+    if (epoch != null && epoch != _playEpoch) return;
+
+    // Kill every voice — a stale handle can leave the synth audible under a
+    // new waveform playhead.
+    try {
+      SoLoud.instance.stopAll();
+    } catch (_) {}
     if (_phraseSource != null) {
-      await SoLoud.instance.disposeSource(_phraseSource!);
+      try {
+        await SoLoud.instance.disposeSource(_phraseSource!);
+      } catch (_) {}
       _phraseSource = null;
     }
+    _phraseHandle = null;
+
+    if (epoch != null && epoch != _playEpoch) return;
 
     final stamp = DateTime.now().microsecondsSinceEpoch;
     _phraseSource = await SoLoud.instance.loadMem(
       'phrase_${label}_$stamp.wav',
       wav,
     );
+    if (epoch != null && epoch != _playEpoch) {
+      try {
+        await SoLoud.instance.disposeSource(_phraseSource!);
+      } catch (_) {}
+      _phraseSource = null;
+      return;
+    }
     _phraseHandle = SoLoud.instance.play(
       _phraseSource!,
       volume: 1.0,
@@ -249,11 +286,24 @@ class AudioEngine {
   }
 
   Future<void> stopPhrase() async {
-    if (_phraseHandle != null &&
-        SoLoud.instance.getIsValidVoiceHandle(_phraseHandle!)) {
-      await SoLoud.instance.stop(_phraseHandle!);
+    _playEpoch++;
+    try {
+      SoLoud.instance.stopAll();
+    } catch (_) {}
+    if (_phraseHandle != null) {
+      try {
+        if (SoLoud.instance.getIsValidVoiceHandle(_phraseHandle!)) {
+          await SoLoud.instance.stop(_phraseHandle!);
+        }
+      } catch (_) {}
     }
     _phraseHandle = null;
+    if (_phraseSource != null) {
+      try {
+        await SoLoud.instance.disposeSource(_phraseSource!);
+      } catch (_) {}
+      _phraseSource = null;
+    }
   }
 
   /// Pause active playback (no-op if nothing is playing).
