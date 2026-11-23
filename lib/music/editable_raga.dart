@@ -215,19 +215,47 @@ class EditableRaga {
     );
   }
 
-  /// Move several points by the same Δbeat/Δcents from [origins] (multi-select drag).
+  /// Move several points from [origins] by [dBeat]/[dCents].
+  ///
+  /// When [snapIndex] is set (the note under the cursor), only that note is
+  /// grid-snapped; the resulting delta is applied to every other selected
+  /// note so relative spacing is preserved (they do not each snap separately).
   void movePointsFromOrigins(
     Map<int, CurvePoint> origins,
     double dBeat,
-    double dCents,
-  ) {
+    double dCents, {
+    int? snapIndex,
+    /// When set, only these notes' bend handles translate with the gold;
+    /// others keep absolute bend (gold can move without its teal handle).
+    Set<int>? translateBendIndices,
+  }) {
+    var useBeat = dBeat;
+    var useCents = dCents;
+    final lead = snapIndex;
+    if (lead != null && origins.containsKey(lead) && gridLock) {
+      final o = origins[lead]!;
+      final snapped = snapPoint(
+        CurvePoint(beat: o.beat + dBeat, cents: o.cents + dCents, amp: o.amp),
+      );
+      useBeat = snapped.beat - o.beat;
+      useCents = snapped.cents - o.cents;
+    }
     for (final e in origins.entries) {
       final i = e.key;
       if (i < 0 || i >= points.length) continue;
       final o = e.value;
-      movePoint(
-        i,
-        CurvePoint(beat: o.beat + dBeat, cents: o.cents + dCents, amp: o.amp),
+      final moveBend = o.hasBend &&
+          (translateBendIndices == null || translateBendIndices.contains(i));
+      points[i] = CurvePoint(
+        beat: o.beat + useBeat,
+        cents: o.cents + useCents,
+        amp: o.amp,
+        bendBeat: moveBend
+            ? o.bendBeat! + useBeat
+            : o.bendBeat,
+        bendCents: moveBend
+            ? o.bendCents! + useCents
+            : o.bendCents,
       );
     }
   }

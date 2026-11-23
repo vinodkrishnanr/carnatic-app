@@ -100,8 +100,13 @@ class RagaGridPainter extends CustomPainter {
     this.activeEdgeDest,
     /// Absolute beat position of the playhead; null hides it.
     this.playheadBeat,
-    /// Live-list indices of selected anchor points (highlighted).
+    /// Live-list indices of selected gold anchors.
     this.selectedIndices = const {},
+    /// Live-list dest indices whose teal bend handles are selected (independent
+    /// of [selectedIndices] — selecting a gold does not select its handle).
+    this.selectedHandleIndices = const {},
+    /// Live Ctrl+drag marquee rectangle in local grid pixels.
+    this.marqueeRect,
   });
 
   final EditableRaga raga;
@@ -112,6 +117,8 @@ class RagaGridPainter extends CustomPainter {
   final int? activeEdgeDest;
   final double? playheadBeat;
   final Set<int> selectedIndices;
+  final Set<int> selectedHandleIndices;
+  final Rect? marqueeRect;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -232,6 +239,11 @@ class RagaGridPainter extends CustomPainter {
     canvas.drawPath(path, stroke);
 
     // Edge bend handles (mid elbow or control).
+    final selectedFill = Paint()..color = AppColors.gold;
+    final selectedRing = Paint()
+      ..color = const Color(0xFF0088FF)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2;
     final handleFill = Paint()..color = AppColors.peacockBright;
     final handleActive = Paint()..color = AppColors.gold;
     final handleRing = Paint()
@@ -272,20 +284,23 @@ class RagaGridPainter extends CustomPainter {
                 p.bendBeat == b.bendBeat &&
                 p.bendCents == b.bendCents),
       );
-      final fill =
-          activeEdgeDest != null && activeEdgeDest == destLive
-              ? handleActive
+      // Handles highlight only when explicitly selected — not when gold is.
+      final handleSelected =
+          destLive >= 0 && selectedHandleIndices.contains(destLive);
+      final fill = activeEdgeDest != null && activeEdgeDest == destLive
+          ? handleActive
+          : handleSelected
+              ? selectedFill
               : handleFill;
-      canvas.drawCircle(handle, 4.5, fill);
-      canvas.drawCircle(handle, 4.5, handleRing);
+      canvas.drawCircle(handle, handleSelected ? 5.5 : 4.5, fill);
+      canvas.drawCircle(
+        handle,
+        handleSelected ? 5.5 : 4.5,
+        handleSelected ? selectedRing : handleRing,
+      );
     }
 
     final dot = Paint()..color = AppColors.goldSoft;
-    final selectedFill = Paint()..color = AppColors.gold;
-    final selectedRing = Paint()
-      ..color = const Color(0xFF0088FF)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2;
     for (final p in pts) {
       final liveIdx = raga.points.indexWhere(
         (q) =>
@@ -317,6 +332,21 @@ class RagaGridPainter extends CustomPainter {
             ..isAntiAlias = true,
         );
       }
+    }
+
+    final box = marqueeRect;
+    if (box != null && box.width.abs() > 1 && box.height.abs() > 1) {
+      canvas.drawRect(
+        box,
+        Paint()..color = AppColors.peacock.withValues(alpha: 0.18),
+      );
+      canvas.drawRect(
+        box,
+        Paint()
+          ..color = AppColors.gold.withValues(alpha: 0.85)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.2,
+      );
     }
     canvas.restore();
   }
@@ -351,6 +381,55 @@ class GridMapper {
 
   Offset offsetBeatCents(double beat, double cents) =>
       viewport.offsetFor(beat, cents, size, raga);
+
+  /// Inclusive point-in-rect (Flutter [Rect.contains] excludes bottom/right).
+  static bool rectHits(Rect rect, Offset o) =>
+      o.dx >= rect.left &&
+      o.dx <= rect.right &&
+      o.dy >= rect.top &&
+      o.dy <= rect.bottom;
+
+  /// True if a circle of [radius] around [o] intersects [rect] (inclusive).
+  /// Used so a marquee that covers the visible node selects it even when the
+  /// exact center sits just outside the box edge.
+  static bool circleHitsRect(Rect rect, Offset o, double radius) {
+    if (radius <= 0) return rectHits(rect, o);
+    final nearestX = o.dx.clamp(rect.left, rect.right);
+    final nearestY = o.dy.clamp(rect.top, rect.bottom);
+    final dx = o.dx - nearestX;
+    final dy = o.dy - nearestY;
+    return dx * dx + dy * dy <= radius * radius;
+  }
+
+  /// Hit radius matching drawn gold anchors / bend handles (~7px ring).
+  static const double marqueeHitRadius = 8;
+
+  /// Gold anchor indices whose drawn circle intersects [rect].
+  /// Does **not** select notes via teal handles — those are separate.
+  Set<int> indicesInRect(Rect rect) {
+    final out = <int>{};
+    for (var i = 0; i < raga.points.length; i++) {
+      if (circleHitsRect(rect, offsetFor(raga.points[i]), marqueeHitRadius)) {
+        out.add(i);
+      }
+    }
+    return out;
+  }
+
+  /// Dest indices of **bent** teal handles whose circle intersects [rect].
+  /// Independent of gold selection; plain step elbows are ignored.
+  Set<int> handleIndicesInRect(Rect rect) {
+    final out = <int>{};
+    for (var i = 0; i < raga.points.length; i++) {
+      final p = raga.points[i];
+      if (!p.hasBend) continue;
+      final handle = offsetBeatCents(p.bendBeat!, p.bendCents!);
+      if (circleHitsRect(rect, handle, marqueeHitRadius)) {
+        out.add(i);
+      }
+    }
+    return out;
+  }
 
   /// Nearest point within [hitPx] screen pixels, or null.
   int? nearestPointIndex(Offset local, {double hitPx = 14}) {

@@ -42,11 +42,17 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   int? _dragIndex;
   /// Destination point index when left-dragging an edge curve handle.
   int? _dragEdgeDest;
-  /// Selected grid anchor indices (live list).
+  /// Selected gold anchor indices (live list).
   final Set<int> _selectedPoints = {};
+  /// Selected teal bend-handle dest indices (independent of gold selection).
+  final Set<int> _selectedHandles = {};
   /// Origins at multi-select drag start (index → point).
   Map<int, CurvePoint>? _multiDragOrigins;
   Offset? _multiDragStartLocal;
+  /// Ctrl+drag marquee selection on the grid.
+  bool _marqueeing = false;
+  Offset? _marqueeStart;
+  Offset? _marqueeCurrent;
   bool _panning = false;
   Offset? _panLast;
   final _viewport = GridViewport();
@@ -244,9 +250,18 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _selectedPoints
         ..clear()
         ..addAll(Iterable.generate(_raga.points.length));
+      _selectedHandles
+        ..clear()
+        ..addAll([
+          for (var i = 0; i < _raga.points.length; i++)
+            if (_raga.points[i].hasBend) i,
+        ]);
+      final bends = _selectedHandles.length;
       _status = _selectedPoints.isEmpty
           ? 'No points to select'
-          : 'Selected ${_selectedPoints.length} points';
+          : bends > 0
+              ? 'Selected ${_selectedPoints.length} points + $bends curves'
+              : 'Selected ${_selectedPoints.length} points';
     });
   }
 
@@ -327,10 +342,12 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         final n = _selectedPoints.length;
         _raga.eraseIndices(_selectedPoints);
         _selectedPoints.clear();
+        _selectedHandles.clear();
         _status = 'Deleted $n point${n == 1 ? '' : 's'}';
       } else {
         _raga.clearCurve();
         _selectedPoints.clear();
+        _selectedHandles.clear();
         _status = 'Cleared grid points';
       }
       _dragIndex = null;
@@ -764,6 +781,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _multiDragOrigins = null;
       _multiDragStartLocal = null;
       _selectedPoints.clear();
+      _selectedHandles.clear();
       _panning = false;
       _panLast = null;
       _status = 'Undid last change';
@@ -773,6 +791,10 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
   void _remapSelectionAfterSort(Iterable<CurvePoint> kept) {
     final keys = kept
         .map((p) => (p.beat, p.cents, p.bendBeat, p.bendCents))
+        .toSet();
+    final handleKeys = kept
+        .where((p) => p.hasBend)
+        .map((p) => (p.bendBeat, p.bendCents))
         .toSet();
     _selectedPoints
       ..clear()
@@ -784,6 +806,17 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
             _raga.points[i].bendBeat,
             _raga.points[i].bendCents,
           )))
+            i,
+      ]);
+    _selectedHandles
+      ..clear()
+      ..addAll([
+        for (var i = 0; i < _raga.points.length; i++)
+          if (_raga.points[i].hasBend &&
+              handleKeys.contains((
+                _raga.points[i].bendBeat,
+                _raga.points[i].bendCents,
+              )))
             i,
       ]);
   }
@@ -822,6 +855,9 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _dragEdgeDest = null;
       _multiDragOrigins = null;
       _multiDragStartLocal = null;
+      _marqueeing = false;
+      _marqueeStart = null;
+      _marqueeCurrent = null;
       _panning = false;
       _panLast = null;
       _autoBendOnDrag = false;
@@ -840,9 +876,11 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
             (hitPoint == null || _selectedPoints.contains(hitPoint))) {
           _raga.eraseIndices(_selectedPoints);
           _selectedPoints.clear();
+          _selectedHandles.clear();
         } else {
           _raga.eraseNear(beat, cents);
           _selectedPoints.clear();
+          _selectedHandles.clear();
         }
         _dragIndex = null;
         _dragEdgeDest = null;
@@ -851,6 +889,31 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
         _panning = false;
         _panLast = null;
         _autoBendOnDrag = false;
+      });
+      return;
+    }
+
+    final ctrl = HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isMetaPressed;
+
+    // Ctrl+left on empty (not on a point) → marquee select, then move group.
+    if (ctrl && hitPoint == null) {
+      _lastLineTapAt = null;
+      _lastLineTapPos = null;
+      _autoBendOnDrag = false;
+      setState(() {
+        _marqueeing = true;
+        _marqueeStart = e.localPosition;
+        _marqueeCurrent = e.localPosition;
+        _dragIndex = null;
+        _dragEdgeDest = null;
+        _multiDragOrigins = null;
+        _multiDragStartLocal = null;
+        _panning = false;
+        _panLast = null;
+        _gridDownPos = null;
+        _gridDidPan = false;
+        _status = null;
       });
       return;
     }
@@ -873,6 +936,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
           _selectedPoints
             ..clear()
             ..add(hitPoint);
+          // Gold selection does not select its teal handle.
+          _selectedHandles.clear();
         }
         _dragIndex = hitPoint;
         _dragEdgeDest = null;
@@ -899,7 +964,11 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _autoBendOnDrag = false;
       _checkpoint();
       setState(() {
+        // Handle selection is independent of gold notes.
         _selectedPoints.clear();
+        _selectedHandles
+          ..clear()
+          ..add(hitHandle);
         _dragIndex = null;
         _dragEdgeDest = hitHandle;
         _multiDragOrigins = null;
@@ -929,6 +998,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
           _selectedPoints
             ..clear()
             ..addAll(idx >= 0 ? [idx] : const <int>[]);
+          _selectedHandles.clear();
           _dragIndex = idx >= 0 ? idx : null;
           _dragEdgeDest = null;
           _multiDragOrigins = null;
@@ -954,6 +1024,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     _gridDidPan = false;
     setState(() {
       _selectedPoints.clear();
+      _selectedHandles.clear();
       _dragIndex = null;
       _dragEdgeDest = null;
       _multiDragOrigins = null;
@@ -975,6 +1046,13 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     }
 
     if ((e.buttons & kPrimaryMouseButton) == 0) return;
+
+    if (_marqueeing && _marqueeStart != null) {
+      setState(() {
+        _marqueeCurrent = e.localPosition;
+      });
+      return;
+    }
 
     if (_panning && _panLast != null) {
       if (!_gridDidPan) {
@@ -1014,7 +1092,15 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       final dBeat = map.beatAt(e.localPosition) - startBeat;
       final dCents = map.centsAt(e.localPosition) - startCents;
       setState(() {
-        _raga.movePointsFromOrigins(origins, dBeat, dCents);
+        // Snap only the note under the cursor; others keep relative offsets.
+        _raga.movePointsFromOrigins(
+          origins,
+          dBeat,
+          dCents,
+          snapIndex: _dragIndex,
+          // Only translate teal handles that are also selected.
+          translateBendIndices: Set<int>.from(_selectedHandles),
+        );
       });
       return;
     }
@@ -1036,7 +1122,51 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
     });
   }
 
-  void _clearDrag() {
+  Rect? get _marqueeRect {
+    final a = _marqueeStart;
+    final b = _marqueeCurrent;
+    if (a == null || b == null) return null;
+    return Rect.fromPoints(a, b);
+  }
+
+  void _finishMarquee(Size? size) {
+    final start = _marqueeStart;
+    final cur = _marqueeCurrent;
+    _marqueeing = false;
+    _marqueeStart = null;
+    _marqueeCurrent = null;
+    if (start == null || cur == null || size == null) return;
+    // Tiny drag (click) → leave selection alone; no seek.
+    if ((cur - start).distance <= _clickSlop) return;
+    final map = _mapper(size);
+    final rect = Rect.fromPoints(start, cur);
+    final picked = map.indicesInRect(rect);
+    final handles = map.handleIndicesInRect(rect);
+    setState(() {
+      _selectedPoints
+        ..clear()
+        ..addAll(picked);
+      _selectedHandles
+        ..clear()
+        ..addAll(handles);
+      if (picked.isEmpty && handles.isEmpty) {
+        _status = 'No points in selection';
+      } else if (handles.isEmpty) {
+        _status = 'Selected ${picked.length} points';
+      } else if (picked.isEmpty) {
+        _status = 'Selected ${handles.length} curves';
+      } else {
+        _status =
+            'Selected ${picked.length} points + ${handles.length} curves';
+      }
+    });
+  }
+
+  void _clearDrag([Size? size]) {
+    if (_marqueeing) {
+      _finishMarquee(size);
+      return;
+    }
     // Empty-grid click (no pan) → snap blue playhead to that beat.
     if (_panning && !_gridDidPan && _gridDownPos != null) {
       _seekGrid(_gridDownBeat);
@@ -1065,8 +1195,6 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       });
     }
   }
-
-  void _onPointerUp(PointerUpEvent e) => _clearDrag();
 
   Future<void> _saveGridToStore() async {
     final name = _nameCtrl.text.trim();
@@ -1314,6 +1442,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
       _nameCtrl.text = _raga.name;
       _detectedBpm = _raga.beatsPerMinute;
       _selectedPoints.clear();
+      _selectedHandles.clear();
       _viewport.zoom = 1.0;
       _viewport.beat0 = 0;
       _viewport.cents0 = _raga.minCents;
@@ -1375,7 +1504,7 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 20),
                     child: Text(
-                      'Click to activate · Space play · Ctrl+A select all · Delete · Ctrl+Z undo',
+                      'Click to activate · Space play · Ctrl+drag marquee · Ctrl+A select all · Delete · Ctrl+Z undo',
                       style: theme.textTheme.bodyMedium,
                     ),
                   ),
@@ -1513,8 +1642,8 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                               },
                               onPointerDown: (e) => _onPointerDown(e, size),
                               onPointerMove: (e) => _onPointerMove(e, size),
-                              onPointerUp: _onPointerUp,
-                              onPointerCancel: (_) => _clearDrag(),
+                              onPointerUp: (_) => _clearDrag(size),
+                              onPointerCancel: (_) => _clearDrag(size),
                               child: CustomPaint(
                                 size: size,
                                 painter: RagaGridPainter(
@@ -1527,6 +1656,10 @@ class _RagaEditorScreenState extends State<RagaEditorScreen> {
                                   selectedIndices: Set<int>.from(
                                     _selectedPoints,
                                   ),
+                                  selectedHandleIndices: Set<int>.from(
+                                    _selectedHandles,
+                                  ),
+                                  marqueeRect: _marqueeRect,
                                 ),
                               ),
                             ),

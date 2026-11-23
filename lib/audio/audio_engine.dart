@@ -178,8 +178,10 @@ class AudioEngine {
     String label = 'curve',
   }) async {
     if (!_ready) await init();
+    // Claim this play, then clear voices *without* bumping again
+    // (stopPhrase() would cancel this same play).
     final epoch = ++_playEpoch;
-    await stopPhrase();
+    await _clearVoices();
     if (epoch != _playEpoch) return null;
 
     final pts = envelope.points;
@@ -221,7 +223,7 @@ class AudioEngine {
   }) async {
     if (!_ready) await init();
     final epoch = ++_playEpoch;
-    await stopPhrase();
+    await _clearVoices();
     if (epoch != _playEpoch) return;
     final wav = encodeWavMonoInt16(mono: mono, sampleRate: pcmSampleRate);
     await _playWavBytes(wav, label: label, epoch: epoch);
@@ -285,8 +287,14 @@ class AudioEngine {
     }
   }
 
+  /// Stop playback and invalidate any in-flight playEnvelope/playMono.
   Future<void> stopPhrase() async {
     _playEpoch++;
+    await _clearVoices();
+  }
+
+  /// Stop/dispose active voice without bumping [_playEpoch].
+  Future<void> _clearVoices() async {
     try {
       SoLoud.instance.stopAll();
     } catch (_) {}

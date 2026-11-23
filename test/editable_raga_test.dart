@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:carnatic_app/music/editable_raga.dart';
@@ -246,7 +247,12 @@ void main() {
     r.gridLock = false;
     r.points.addAll([
       CurvePoint(beat: 1, cents: 0),
-      CurvePoint(beat: 2, cents: 200),
+      CurvePoint(
+        beat: 2,
+        cents: 200,
+        bendBeat: 1.5,
+        bendCents: 100,
+      ),
       CurvePoint(beat: 3, cents: 400),
     ]);
     final origins = {
@@ -259,11 +265,177 @@ void main() {
     expect(r.points[0].cents, closeTo(-50, 1e-9));
     expect(r.points[1].beat, closeTo(2.5, 1e-9));
     expect(r.points[1].cents, closeTo(150, 1e-9));
+    expect(r.points[1].bendBeat, closeTo(2.0, 1e-9));
+    expect(r.points[1].bendCents, closeTo(50, 1e-9));
     expect(r.points[2].beat, closeTo(3.5, 1e-9));
     expect(r.points[2].cents, closeTo(350, 1e-9));
     r.eraseIndices({0, 2});
     expect(r.points.length, 1);
     expect(r.points[0].beat, closeTo(2.5, 1e-9));
+  });
+
+  test('multi-select snaps only dragged note; others keep relative offsets', () {
+    final r = EditableRaga.shankarabharanamTemplate()..clearCurve();
+    r.gridLock = true;
+    r.toneSnap = ToneSnap.mini; // ¼ beat, 25¢
+    r.points.addAll([
+      CurvePoint(beat: 1.0, cents: 0),
+      CurvePoint(beat: 1.37, cents: 40), // off-grid relative to leader
+      CurvePoint(beat: 2.1, cents: 210),
+    ]);
+    final origins = {
+      0: r.points[0],
+      1: r.points[1],
+      2: r.points[2],
+    };
+    // Drag leader toward beat 1.12 / 12¢ → snaps to 1.0 / 0 or 1.25 / 25.
+    r.movePointsFromOrigins(origins, 0.12, 12, snapIndex: 0);
+    final lead = r.points[0];
+    expect(lead.beat, closeTo(1.0, 1e-9)); // 1.12 → mini beat snap 1.0
+    expect(lead.cents, closeTo(0, 1e-9));
+    // Others = origin + (snappedLead - leadOrigin); not independently snapped.
+    expect(r.points[1].beat, closeTo(1.37, 1e-9));
+    expect(r.points[1].cents, closeTo(40, 1e-9));
+    expect(r.points[2].beat, closeTo(2.1, 1e-9));
+    expect(r.points[2].cents, closeTo(210, 1e-9));
+    // Non-zero move that snaps leader forward.
+    r.points[0] = origins[0]!;
+    r.points[1] = origins[1]!;
+    r.points[2] = origins[2]!;
+    r.movePointsFromOrigins(origins, 0.3, 30, snapIndex: 0);
+    expect(r.points[0].beat, closeTo(1.25, 1e-9)); // 1.3 → 1.25
+    expect(r.points[0].cents, closeTo(25, 1e-9)); // 30 → 25
+    expect(r.points[1].beat, closeTo(1.37 + 0.25, 1e-9));
+    expect(r.points[1].cents, closeTo(40 + 25, 1e-9));
+    expect(r.points[2].beat, closeTo(2.1 + 0.25, 1e-9));
+    expect(r.points[2].cents, closeTo(210 + 25, 1e-9));
+  });
+
+  test('marquee rect selects points by screen position', () {
+    final r = EditableRaga.shankarabharanamTemplate()..clearCurve();
+    r.gridLock = false;
+    r.points.addAll([
+      CurvePoint(beat: 1, cents: 0),
+      CurvePoint(beat: 2, cents: 200),
+      CurvePoint(beat: 4, cents: 700),
+    ]);
+    final vp = GridViewport();
+    const size = Size(400, 300);
+    final map = GridMapper(size: size, raga: r, viewport: vp);
+    final a = map.offsetFor(r.points[0]);
+    final b = map.offsetFor(r.points[1]);
+    final rect = Rect.fromPoints(
+      Offset(a.dx - 4, a.dy + 4),
+      Offset(b.dx + 4, b.dy - 4),
+    );
+    final picked = map.indicesInRect(rect);
+    expect(picked.contains(0), isTrue);
+    expect(picked.contains(1), isTrue);
+    expect(picked.contains(2), isFalse);
+  });
+
+  test('marquee gold vs teal handles are independent', () {
+    final r = EditableRaga.shankarabharanamTemplate()..clearCurve();
+    r.gridLock = false;
+    r.points.addAll([
+      CurvePoint(beat: 1, cents: 0),
+      CurvePoint(beat: 1.05, cents: 200),
+      CurvePoint(
+        beat: 8,
+        cents: 700,
+        bendBeat: 1.2,
+        bendCents: 100,
+      ),
+    ]);
+    final vp = GridViewport();
+    const size = Size(400, 300);
+    final map = GridMapper(size: size, raga: r, viewport: vp);
+    final a = map.offsetFor(r.points[0]);
+    final b = map.offsetFor(r.points[1]);
+    final handle = map.offsetBeatCents(1.2, 100);
+    final rect = Rect.fromPoints(
+      Offset(
+        math.min(a.dx, handle.dx) - 6,
+        math.min(a.dy, math.min(b.dy, handle.dy)) - 6,
+      ),
+      Offset(
+        math.max(b.dx, handle.dx) + 6,
+        math.max(a.dy, math.max(b.dy, handle.dy)) + 6,
+      ),
+    );
+    // Golds in box — far dest gold stays out.
+    final golds = map.indicesInRect(rect);
+    expect(golds.contains(0), isTrue);
+    expect(golds.contains(1), isTrue);
+    expect(golds.contains(2), isFalse);
+    // Teal handle in box selects handle only — not the far gold note.
+    expect(map.handleIndicesInRect(rect), equals({2}));
+    final bendOnly = Rect.fromCenter(center: handle, width: 14, height: 14);
+    expect(map.indicesInRect(bendOnly), isEmpty);
+    expect(map.handleIndicesInRect(bendOnly), equals({2}));
+  });
+
+  test('multi-move translates bend only when handle selected', () {
+    final r = EditableRaga(
+      id: 't',
+      name: 't',
+      scale: const [],
+      points: [
+        const CurvePoint(beat: 0, cents: 0),
+        const CurvePoint(
+          beat: 2,
+          cents: 200,
+          bendBeat: 1,
+          bendCents: 100,
+        ),
+      ],
+      gridLock: false,
+    );
+    final origins = {1: r.points[1]};
+    r.movePointsFromOrigins(
+      origins,
+      1,
+      50,
+      translateBendIndices: const {},
+    );
+    expect(r.points[1].beat, closeTo(3, 1e-9));
+    expect(r.points[1].cents, closeTo(250, 1e-9));
+    expect(r.points[1].bendBeat, closeTo(1, 1e-9));
+    expect(r.points[1].bendCents, closeTo(100, 1e-9));
+
+    r.movePointsFromOrigins(
+      {1: r.points[1]},
+      1,
+      0,
+      translateBendIndices: {1},
+    );
+    expect(r.points[1].bendBeat, closeTo(2, 1e-9));
+  });
+
+  test('marquee selects gold when visible circle intersects box', () {
+    final r = EditableRaga.shankarabharanamTemplate()..clearCurve();
+    r.gridLock = false;
+    r.points.addAll([
+      CurvePoint(beat: 1, cents: 0),
+      CurvePoint(beat: 1.02, cents: 180),
+    ]);
+    final vp = GridViewport();
+    const size = Size(400, 300);
+    final map = GridMapper(size: size, raga: r, viewport: vp);
+    final mid = map.offsetFor(r.points[1]);
+    // Box stops short of the center but overlaps the drawn node (~7px).
+    final rect = Rect.fromLTRB(
+      mid.dx - 20,
+      mid.dy - 20,
+      mid.dx - 4,
+      mid.dy + 20,
+    );
+    expect(GridMapper.rectHits(rect, mid), isFalse);
+    expect(
+      GridMapper.circleHitsRect(rect, mid, GridMapper.marqueeHitRadius),
+      isTrue,
+    );
+    expect(map.indicesInRect(rect), equals({1}));
   });
 
   test('raga store round-trips JSON', () async {
